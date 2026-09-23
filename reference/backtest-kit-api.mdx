@@ -1,0 +1,653 @@
+---
+title: "backtest-kit API: Strategies, Listeners, and Commit Functions"
+sidebarTitle: "backtest-kit API"
+description: "Complete reference for all backtest-kit functions used in backtest-ollama-casual: addStrategySchema, listeners, commit functions, State, Position helpers, Cache, and Log."
+---
+
+This page documents every `backtest-kit` function used in the project's strategy files. All imports are from the `"backtest-kit"` package (version `20.1.0`).
+
+```typescript
+import {
+  addStrategySchema,
+  listenIdlePing,
+  listenActivePing,
+  listenError,
+  commitCreateSignal,
+  commitClosePending,
+  commitBreakeven,
+  commitSignalNotify,
+  State,
+  Position,
+  Cache,
+  Log,
+} from "backtest-kit";
+```
+
+---
+
+## Strategy Registration
+
+### `addStrategySchema`
+
+Registers a strategy with the backtest-kit framework. Called once at module load time.
+
+```typescript
+addStrategySchema({
+  strategyName: string;
+  getSignal?: (symbol: string, when: Date) => Promise<SignalDto | null>;
+}): void
+```
+
+<ParamField path="strategyName" type="string" required>
+  Unique name for the strategy. Must match the name used in reports and dump files.
+</ParamField>
+
+<ParamField path="getSignal" type="(symbol: string, when: Date) => Promise<SignalDto | null>">
+  Optional signal function. Called by the framework on every tick when no position is open. Return a `SignalDto` to open a position, or `null` to pass. **Omit this entirely for event-driven strategies** that open positions via `commitCreateSignal` inside `listenIdlePing`.
+</ParamField>
+
+**Pattern 1 — classic `getSignal`** (crypto_yoda_channel: post → structured signal with levels):
+
+```typescript
+addStrategySchema({
+  strategyName: "main_strategy",
+  getSignal: async (symbol, when) => {
+    const { entry } = await getSignal(symbol, when); // Cache.file wrapped
+    if (!entry || entry.position === "wait") return null;
+    return {
+      id: `${entry.id}-${entry.symbol.toLowerCase()}`,
+      symbol: entry.symbol,
+      position: entry.position,
+      priceStopLoss: entry.stoploss,
+      priceTakeProfit: Math.max(...entry.targets),
+      minuteEstimatedTime: Infinity,
+      payload: { levels: entry.targets },
+      note: JSON.stringify(info, null, 2),
+    };
+  },
+});
+```
+
+**Pattern 2 — event-driven, no `getSignal`** (vershinin_trader: entry and exit are separate LLM pipelines):
+
+```typescript
+addStrategySchema({
+  strategyName: "main_strategy",
+  // no getSignal — positions opened via commitCreateSignal in listenIdlePing
+});
+```
+
+---
+
+### `addExchangeSchema`
+
+Registers the exchange data module. Called once in `modules/backtest.module.ts` or `modules/paper.module.ts`.
+
+```typescript
+addExchangeSchema({
+  exchangeName: string;
+  getCandles: (symbol: string, interval: string, limit: number) => Promise<Candle[]>;
+  getOrderBook?: (symbol: string) => Promise<OrderBook>;
+  formatPrice: (symbol: string, price: number) => string;
+  formatQuantity: (symbol: string, qty: number) => string;
+}): void
+```
+
+<ParamField path="exchangeName" type="string" required>
+  Unique exchange identifier. Both backtest and paper modules use `"ccxt-exchange"`. Only one exchange module may be loaded per run.
+</ParamField>
+
+<ParamField path="getCandles" type="function" required>
+  Fetches OHLCV candles. Returns `{ timestamp, open, high, low, close, volume }[]`.
+</ParamField>
+
+<ParamField path="formatPrice" type="function" required>
+  Formats a price to the exchange's tick size. Returns a string.
+</ParamField>
+
+<ParamField path="formatQuantity" type="function" required>
+  Formats a quantity to the exchange's lot size. Returns a string.
+</ParamField>
+
+---
+
+### `addFrameSchema`
+
+Registers a backtest time frame. Required only for `--backtest` and `--cache` runs; not needed for live/paper.
+
+```typescript
+addFrameSchema({
+  frameName: string;
+  dateStart: Date;
+  dateEnd: Date;
+  symbols: string[];
+}): void
+```
+
+<ParamField path="frameName" type="string" required>
+  Unique frame identifier. Changing the date range requires a new name to avoid cache collisions.
+</ParamField>
+
+<ParamField path="dateStart" type="Date" required>
+  Backtest start date (inclusive).
+</ParamField>
+
+<ParamField path="dateEnd" type="Date" required>
+  Backtest end date (exclusive).
+</ParamField>
+
+<ParamField path="symbols" type="string[]" required>
+  List of trading symbols for this frame. Also set in `SYMBOL_LIST` in `loader.config.ts`.
+</ParamField>
+
+---
+
+## Event Listeners
+
+Listeners are registered once at module load. They receive async callbacks that run on every matching tick.
+
+### `listenIdlePing`
+
+Fires on every tick when **no position is open** for the symbol. Used for event-driven entry.
+
+```typescript
+listenIdlePing(
+  callback: (ctx: { symbol: string; when: Date; currentPrice: number }) => Promise<void>
+): void
+```
+
+<ParamField path="callback" type="function" required>
+  Async function called each tick. Always wrap any LLM or Telegram call inside `Cache.file` — this fires once per minute per symbol.
+</ParamField>
+
+```typescript
+listenIdlePing(async ({ symbol, when, currentPrice }) => {
+  const { signal } = await getOpenSignal(symbol, when); // must be Cache.file wrapped
+  if (!signal || signal.position === "wait") return;
+  await commitCreateSignal(symbol, {
+    id: `${signal.id}-${signal.symbol.toLowerCase()}`,
+    symbol: signal.symbol,
+    ...Position.moonbag({
+      position: signal.position,
+      currentPrice,
+      percentStopLoss: HARD_STOP_PERCENT,
+    }),
+  });
+});
+```
+
+---
+
+### `listenActivePing`
+
+Fires on every tick when a position **is open** for the symbol. Used for ratchet/trailing logic, breakeven moves, and LLM-driven close decisions.
+
+```typescript
+listenActivePing(
+  callback: (ctx: {
+    data: ActiveSignalData;
+    currentPrice: number;
+    backtest: boolean;
+    when: Date;
+  }) => Promise<void>
+): void
+```
+
+<ParamField path="callback" type="function" required>
+  Async function called each tick while a position is active.
+</ParamField>
+
+`data` fields available inside the callback:
+
+| Field | Type | Description |
+|---|---|---|
+| `data.id` | `string` | Signal identifier |
+| `data.symbol` | `string` | Trading symbol |
+| `data.position` | `string` | `"long"` or `"short"` |
+| `data.priceOpen` | `number` | Entry price |
+| `data.priceStopLoss` | `number` | Current stop-loss (may have moved after breakeven) |
+| `data.priceTakeProfit` | `number` | Take-profit level |
+| `data.payload` | `object` | Strategy payload (e.g. `{ levels: number[] }`) |
+| `data.pendingAt` | `number` | Timestamp (ms) when the signal was queued |
+
+```typescript
+listenActivePing(async ({ data, currentPrice, backtest, when }) => {
+  const levels = data.payload.levels as number[];
+  const currentLevel = getCurrentLevel(data.position, levels, currentPrice);
+  const { lastLevel } = await LEVEL_STATE.getState();
+
+  if (currentLevel > lastLevel) {
+    await LEVEL_STATE.setState({ lastLevel: currentLevel });
+    await commitSignalNotify(data.symbol, {
+      notificationNote: `Level ${currentLevel} of ${levels.length} reached`,
+    });
+    return;
+  }
+
+  if (drift > step * LEVEL_DRIFT_RATIO) {
+    await commitClosePending(data.symbol);
+  }
+});
+```
+
+Multiple `listenActivePing` handlers can be registered independently — for example, one for ratchet logic and one for breakeven moves.
+
+---
+
+### `listenError`
+
+Fires when an unhandled error occurs inside the framework or a strategy callback.
+
+```typescript
+listenError(callback: (error: unknown) => void): void
+```
+
+<ParamField path="callback" type="function" required>
+  Error handler. Receives the raw error object. Used to forward errors to `Log.debug`.
+</ParamField>
+
+```typescript
+import { errorData, getErrorMessage } from "functools-kit";
+
+listenError((error) => {
+  console.log(error);
+  Log.debug("error", {
+    error: errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+```
+
+---
+
+## Commit Functions
+
+Commit functions are called inside listener callbacks to manipulate the open position. Each call is queued; the next tick processes it.
+
+### `commitCreateSignal`
+
+Queues a new signal for the next tick. The framework opens the position on the following tick. **Rejected** if a signal or pending action already exists for the symbol.
+
+```typescript
+commitCreateSignal(
+  symbol: string,
+  dto: {
+    id: string;
+    symbol: string;
+    position: "long" | "short";
+    priceTakeProfit: number;
+    priceStopLoss: number;
+    minuteEstimatedTime: number;
+    payload?: Record<string, unknown>;
+    note?: string;
+    priceOpen?: number;        // omit for market entry
+  }
+): Promise<void>
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading symbol (must match the one received in the listener).
+</ParamField>
+
+<ParamField path="dto.id" type="string" required>
+  Unique signal identifier. Convention: `"${postId}-${symbol.toLowerCase()}"`.
+</ParamField>
+
+<ParamField path="dto.position" type='"long" | "short"' required>
+  Trade direction.
+</ParamField>
+
+<ParamField path="dto.priceTakeProfit" type="number" required>
+  Take-profit price.
+</ParamField>
+
+<ParamField path="dto.priceStopLoss" type="number" required>
+  Stop-loss price.
+</ParamField>
+
+<ParamField path="dto.minuteEstimatedTime" type="number" required>
+  Estimated hold time in minutes. Use `Infinity` for open-ended positions.
+</ParamField>
+
+<ParamField path="dto.priceOpen" type="number">
+  If omitted, enters at market immediately. If set, creates a scheduled (limit) signal that waits for price.
+</ParamField>
+
+<ParamField path="dto.payload" type="object">
+  Arbitrary strategy data attached to the signal (e.g. `{ levels: number[] }`). Accessible in `listenActivePing` via `data.payload`.
+</ParamField>
+
+<ParamField path="dto.note" type="string">
+  Free-text note. Serialized in `backtest.jsonl` `opened` events. Convention: `JSON.stringify(info, null, 2)` with the source post.
+</ParamField>
+
+---
+
+### `commitClosePending`
+
+Closes the currently open position for the symbol at market.
+
+```typescript
+commitClosePending(
+  symbol: string,
+  opts?: { note?: string }
+): Promise<void>
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading symbol.
+</ParamField>
+
+<ParamField path="opts.note" type="string">
+  Optional note recorded in `backtest.jsonl` alongside the `closed` event.
+</ParamField>
+
+```typescript
+await commitClosePending(data.symbol, {
+  note: JSON.stringify({ signal, url }, null, 2),
+});
+```
+
+---
+
+### `commitBreakeven`
+
+Moves the stop-loss to the entry price (`priceOpen`). Returns `true` if the stop was actually moved, `false` if it was already at breakeven or already beyond it.
+
+```typescript
+commitBreakeven(symbol: string): Promise<boolean>
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading symbol.
+</ParamField>
+
+```typescript
+const moved = await commitBreakeven(data.symbol);
+if (moved) {
+  Log.info("trailing breakeven", { symbol: data.symbol, priceOpen: data.priceOpen });
+  await BREAKEVEN_STATE.setState({ breakevenSet: true });
+}
+```
+
+---
+
+### `commitSignalNotify`
+
+Sends a notification without changing the position state. Used to announce level milestones and ratchet events.
+
+```typescript
+commitSignalNotify(
+  symbol: string,
+  opts: { notificationNote: string }
+): Promise<void>
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading symbol.
+</ParamField>
+
+<ParamField path="opts.notificationNote" type="string" required>
+  Notification message text.
+</ParamField>
+
+```typescript
+await commitSignalNotify(data.symbol, {
+  notificationNote: `Level ${currentLevel} of ${levels.length} reached (target ${levels[currentLevel - 1]})`,
+});
+```
+
+---
+
+## State
+
+Per-signal state container. Automatically resets when the signal closes, so it is safe to reuse across multiple trades.
+
+```typescript
+new State<T>({
+  initialData: T;
+  name: string;
+}): State<T>
+```
+
+<ParamField path="initialData" type="T" required>
+  Initial value that the state resets to after each signal closes.
+</ParamField>
+
+<ParamField path="name" type="string" required>
+  Unique state identifier within the strategy.
+</ParamField>
+
+<Warning>
+  Never call `State.enable()` — `@backtest-kit/cli` calls it automatically. Calling it manually will break the framework's async context tracking.
+</Warning>
+
+### `state.getState()`
+
+```typescript
+state.getState(): Promise<T>
+```
+
+Returns the current state object.
+
+### `state.setState(data)`
+
+```typescript
+state.setState(data: Partial<T>): Promise<void>
+```
+
+Merges `data` into the current state (shallow merge).
+
+**Example — tracking the last reached level:**
+
+```typescript
+const LEVEL_STATE = new State({
+  initialData: { lastLevel: 0 },
+  name: "level_state",
+});
+
+const BREAKEVEN_STATE = new State({
+  initialData: { breakevenSet: false },
+  name: "breakeven_state",
+});
+
+// inside listenActivePing:
+const { lastLevel } = await LEVEL_STATE.getState();
+if (currentLevel > lastLevel) {
+  await LEVEL_STATE.setState({ lastLevel: currentLevel });
+}
+```
+
+State instances are declared at module scope — use instance methods (`getState`/`setState`), not the deprecated static `_getState`/`_setState`.
+
+---
+
+## Position Helpers
+
+### `Position.moonbag`
+
+Calculates TP/SL for an open-ended position ("hold until cancelled"). Take-profit is fixed at +50% from entry (effectively an "until cancelled" level). Stop-loss is the given percentage from entry. Direction-aware: correctly inverts calculations for short positions.
+
+```typescript
+Position.moonbag({
+  position: "long" | "short";
+  currentPrice: number;
+  percentStopLoss: number;
+}): {
+  position: "long" | "short";
+  priceTakeProfit: number;
+  priceStopLoss: number;
+}
+```
+
+<ParamField path="position" type='"long" | "short"' required>
+  Trade direction.
+</ParamField>
+
+<ParamField path="currentPrice" type="number" required>
+  Current market price (entry price for market orders).
+</ParamField>
+
+<ParamField path="percentStopLoss" type="number" required>
+  Stop-loss distance as a percentage (e.g. `7.5` for 7.5%).
+</ParamField>
+
+```typescript
+await commitCreateSignal(symbol, {
+  id: `${signal.id}-${signal.symbol.toLowerCase()}`,
+  symbol: signal.symbol,
+  ...Position.moonbag({
+    position: signal.position,  // "long" | "short"
+    currentPrice,               // from listenIdlePing ctx
+    percentStopLoss: 7.5,
+  }),
+  minuteEstimatedTime: Infinity,
+});
+```
+
+---
+
+### `Position.bracket`
+
+Constructs a position DTO with explicit TP/SL values. Use when the channel provides specific price levels.
+
+```typescript
+Position.bracket({
+  position: "long" | "short";
+  priceOpen: number;
+  priceTakeProfit: number;
+  priceStopLoss: number;
+}): {
+  position: "long" | "short";
+  priceOpen: number;
+  priceTakeProfit: number;
+  priceStopLoss: number;
+}
+```
+
+---
+
+## Cache
+
+### `Cache.file`
+
+Wraps an async function with **persistent caching** backed by MongoDB (`measure-items` collection). Every call is keyed by `entryKey = SYMBOL_timestamp` (the tick timestamp rounded to the `interval` bucket). Prevents repeated LLM and Telegram calls when the same tick is replayed (or when multiple symbols share the same time bucket).
+
+```typescript
+Cache.file<T>(
+  fn: (...args: unknown[]) => Promise<T>,
+  opts: {
+    interval: string;   // e.g. "5m", "4h"
+    name: string;       // cache namespace — version on schema/logic changes
+  }
+): (...args: unknown[]) => Promise<T>
+```
+
+<ParamField path="fn" type="function" required>
+  Async function to wrap. Its return value is serialized to JSON and stored in MongoDB.
+</ParamField>
+
+<ParamField path="opts.interval" type="string" required>
+  Bucket width. All calls within a single bucket window return the same cached result. Examples: `"5m"` (production, tight freshness), `"4h"` (test runs to limit LLM calls).
+</ParamField>
+
+<ParamField path="opts.name" type="string" required>
+  Cache namespace. **Must be changed whenever the schema or post-selection logic changes** — stale cached results from a previous schema will otherwise mix with new ones.
+</ParamField>
+
+**MongoDB storage:**
+
+| Field | Value |
+|---|---|
+| `bucket` | `"<name>_<interval>_0"` (e.g. `"crypto_yoda_entry_v3_5m_0"`) |
+| `entryKey` | `"SYMBOL_<timestamp_ms>"` |
+| `payload.data` | The return value of `fn` |
+
+```typescript
+const getSignal = Cache.file(
+  async (symbol: string, when: Date) => {
+    const messages = await scrapeLookback({ channel, limit: 15, dimension: "minute", when });
+    const entry = await generateObject(InferenceName.OllamaInference, { format, messages: [...] }, "gemma4:31b-cloud");
+    return { entry };
+  },
+  {
+    interval: "5m",      // production: tight cache = fresh posts only
+    name: "crypto_yoda_entry_v3",  // bump to v4 on any schema change
+  },
+);
+```
+
+<Warning>
+  When reading cached results from MongoDB, `date` fields from `ScraperMessage` are plain strings (JSON serialization). Always wrap with `new Date(message.date)` before calling `.getTime()`.
+</Warning>
+
+---
+
+## Log
+
+Global structured logger with pluggable backends. Context (`strategyName`, `symbol`, `when`, `backtest`) is automatically injected via `async_hooks` — no need to pass it explicitly inside strategies or listeners.
+
+### `Log.info`
+
+For rare, significant events and state transitions.
+
+```typescript
+Log.info(topic: string, payload: Record<string, unknown>): void
+```
+
+### `Log.debug`
+
+For dense measurement streams used to tune thresholds (drift ratios, stagnation timing).
+
+```typescript
+Log.debug(topic: string, payload: Record<string, unknown>): void
+```
+
+### `Log.warn`
+
+```typescript
+Log.warn(topic: string, payload: Record<string, unknown>): void
+```
+
+### `Log.useJsonl`
+
+Switches the backend to write records to `dump/log/log.jsonl`. Called once in `config/setup.config.ts`.
+
+```typescript
+Log.useJsonl(): void
+```
+
+**Log record structure** in `log.jsonl`:
+
+```jsonc
+{
+  "type": "info",
+  "timestamp": "2026-08-14T09:32:00.000Z",   // backtest tick time
+  "createdAt": "2024-12-01T10:05:23.000Z",    // real wall-clock time
+  "methodContext": { "strategyName": "main_strategy", "exchangeName": "ccxt-exchange", "frameName": "..." },
+  "executionContext": { "when": "...", "symbol": "BTCUSDT", "backtest": true },
+  "topic": "crypto_yoda trailing drift",
+  "args": [{ "signalId": "...", "driftRatio": 0.14, "driftRatioLimit": 0.3 }]
+}
+```
+
+**Convention:**
+
+- `Log.info` — transitions: level reached, ratchet closed, breakeven set
+- `Log.debug` — dense per-tick measurements: drift on every active ping (only when `drift > 0`), stagnation with throttling (e.g. `minutesActive % 15 === 0`)
+
+**Payload rules:** keep payloads flat, use raw numbers (not formatted strings), always include a ratio field for future threshold tuning (e.g. `driftRatio = drift / step`), and include the current threshold value (`driftRatioLimit`) so logs remain self-describing.
+
+```typescript
+Log.debug("crypto_yoda trailing drift", {
+  signalId: data.id,
+  symbol: data.symbol,
+  position: data.position,
+  drift,
+  step,
+  driftRatio,           // ratio for threshold analysis
+  driftRatioLimit: LEVEL_DRIFT_RATIO,  // current threshold
+  currentPrice,
+  when: when.toISOString(),
+});
+```

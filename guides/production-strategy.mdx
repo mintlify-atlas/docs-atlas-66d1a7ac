@@ -1,0 +1,287 @@
+---
+title: "Step 4: Ship the Production Strategy with 5-Minute Cache"
+sidebarTitle: "Production Strategy"
+description: "Convert the test strategy into a production main.strategy.ts: 5-minute cache, 15-minute freshness gate, final entry rules, and walk-forward validated constants."
+---
+
+## From Test to Production
+
+Copy `main.test.ts` to `main.strategy.ts` and make the following changes. Each change is mandatory — skipping any one of them will silently degrade the strategy.
+
+### 1. New Cache Name
+
+Increment the version suffix:
+
+```typescript
+// test
+{ interval: "4h", name: "<channel>_entry_v1" }
+
+// production
+{ interval: "5m", name: "<channel>_entry_v2" }
+```
+
+<Warning>
+**Cache name invariant:** change the name on ANY schema update, ANY change to post-selection logic, and ANY addition of images. Old cached responses are stored under the old name — reusing it pollutes the new run with responses from a different schema. When in doubt, increment.
+</Warning>
+
+### 2. Cache Interval: 5m
+
+```typescript
+Cache.file(
+  async (symbol: string, when: Date) => { ... },
+  {
+    interval: "5m",          // was "4h"
+    name: "<channel>_entry_v2",
+  },
+)
+```
+
+### 3. Scrape Window: Only Fresh Posts
+
+Switch from a 4-hour lookback to a 15-minute freshness window:
+
+```typescript
+const FRESH_WINDOW_MINUTES = 15;
+
+let messages = await scrapeLookback({
+  channel: CHANNEL_NAME,
+  limit: FRESH_WINDOW_MINUTES,    // 15 minutes
+  dimension: "minute",
+  when,
+});
+```
+
+Only posts published in the last 15 minutes reach the LLM. Older posts do not produce a new cache entry — the 5-minute cache interval guarantees the function is only called when the window advances.
+
+### 4. Freshness Gate in getSignal
+
+After the LLM call, discard stale messages before returning:
+
+```typescript
+addStrategySchema({
+  strategyName: "main_strategy",
+  getSignal: async (symbol, when) => {
+
+    const { entry, message, url } = await getSignal(symbol, when);
+
+    if (!entry) return null;
+    if (entry.position === "wait") return null;
+
+    // Freshness gate — required because Cache.file persists JSON:
+    // message.date is a string after deserialization, not a Date object.
+    if (when.getTime() - new Date(message.date).getTime() > FRESH_WINDOW_MINUTES * 60_000) {
+      return null;
+    }
+
+    // ... entry rules follow
+  },
+});
+```
+
+<Tip>
+**Why `new Date(message.date)`?** `Cache.file` serializes the function result to JSON. On the next read from cache, `date` is a plain string — calling `.getTime()` directly on it returns `NaN`. Always wrap with `new Date(...)` before arithmetic.
+</Tip>
+
+## Entry Rules: From the Channel's Format
+
+Entry rules come from what the author posts, not from defaults. Three examples — pick the one that matches your channel.
+
+### Market Entry (crypto_yoda: range + 5 targets + stop)
+
+No price gate — momentum signals don't return to the zone:
+
+```typescript
+if (!entry.targets[2]) {
+  return null;  // require at least 3 targets
+}
+
+const priceTakeProfit = entry.position === "long"
+  ? Math.max(...entry.targets)   // farthest target
+  : Math.min(...entry.targets);
+
+return {
+  id: `${entry.id}-${entry.symbol.toLowerCase()}`,
+  symbol: entry.symbol,
+  position: entry.position as Position,
+  priceStopLoss: entry.stoploss,
+  priceTakeProfit,
+  minuteEstimatedTime: Infinity,
+  payload: {
+    levels: entry.targets,  // ratchet levels for position management
+  },
+  note: JSON.stringify({ symbol, entry, message: omit(message, "photo"), url }, null, 2),
+};
+```
+
+### Event-Driven Entry (vershinin: listenIdlePing)
+
+When the author posts entries and exits in separate posts, use the event-driven pattern. The `addStrategySchema` call has no `getSignal`:
+
+```typescript
+addStrategySchema({ strategyName: "main_strategy" });
+
+listenIdlePing(async ({ symbol, when, currentPrice }) => {
+  const { signal, message } = await getOpenSignal(symbol, when);  // always under Cache.file
+
+  if (!signal || (signal.position !== "long" && signal.position !== "short")) {
+    return;
+  }
+
+  await commitCreateSignal(symbol, {
+    id: `${signal.id}-${signal.symbol.toLowerCase()}`,
+    symbol: signal.symbol,
+    ...Position.moonbag({
+      position: signal.position,
+      currentPrice,
+      percentStopLoss: HARD_STOP_PERCENT,
+    }),
+    note: JSON.stringify({ signal, message: omit(message, "photo") }, null, 2),
+  });
+});
+```
+
+`listenIdlePing` fires every minute while there is no open position. `Position.moonbag` sets take-profit to +50% of current price (effectively "until cancelled") and stop-loss to `HARD_STOP_PERCENT` below entry — used when the author does not publish stop levels.
+
+### Direction-Only Channel (time exit)
+
+If the channel gives only direction with no targets, derive the exit horizon from an event study over historical signals (see `assets/event-study.mjs`). Use a fixed `minuteEstimatedTime` based on the measured edge horizon:
+
+```typescript
+return {
+  // ...
+  minuteEstimatedTime: EDGE_HORIZON_MINUTES,  // from event study, e.g. 720 (12h)
+  priceTakeProfit: entry.position === "long"
+    ? currentPrice * (1 + TARGET_PERCENT / 100)
+    : currentPrice * (1 - TARGET_PERCENT / 100),
+};
+```
+
+## Position Management
+
+Copy management logic from `main.test.ts` — it contains the full implementations. Do not rewrite.
+
+### Level Ratchet (crypto_yoda)
+
+Tracks the highest reached target level and closes on a pullback exceeding `LEVEL_DRIFT_RATIO` of the level step:
+
+```typescript
+const LEVEL_DRIFT_RATIO = 0.3;
+
+listenActivePing(async ({ data, currentPrice, when }) => {
+  const levels = data.payload.levels as number[];
+  const currentLevel = getCurrentLevel(data.position as Position, levels, currentPrice);
+  const { lastLevel } = await LEVEL_STATE.getState();
+
+  if (currentLevel > lastLevel) {
+    await LEVEL_STATE.setState({ lastLevel: currentLevel });
+    return;
+  }
+
+  if (!lastLevel) return;
+
+  const drift = getLevelDrift(data.position as Position, levels, lastLevel, currentPrice);
+  const step = getLevelStep(levels, lastLevel);
+
+  if (drift > step * LEVEL_DRIFT_RATIO) {
+    await commitClosePending(data.symbol);
+  }
+});
+```
+
+`LEVEL_DRIFT_RATIO = 0.3` was kept conservatively: the measured ceiling of noise-level pullbacks in August 2026 was 0.186 (n=62), meaning any threshold from 0.2–0.3 would not have closed live positions prematurely. This is a distribution measurement, not a P&L fit.
+
+### Structural Breakeven
+
+Moves stop-loss to break-even after price reaches 50% of the way to TP1:
+
+```typescript
+listenActivePing(async ({ data, currentPrice }) => {
+  const levels = data.payload.levels as number[];
+  const { breakevenSet } = await BREAKEVEN_STATE.getState();
+  if (breakevenSet) return;
+
+  const progressToTp1 = getProgress(data.position as Position, data.priceOpen, levels[0], currentPrice);
+  if (progressToTp1 < BREAKEVEN_TP1_PROGRESS) return;
+
+  const moved = await commitBreakeven(data.symbol);
+  if (moved) {
+    await BREAKEVEN_STATE.setState({ breakevenSet: true });
+  }
+});
+```
+
+### Dual LLM Close (vershinin)
+
+For channels where the author announces exits in separate posts:
+
+```typescript
+listenActivePing(async ({ symbol, data, when }) => {
+  const { signal } = await getCloseSignal(symbol, when);  // schema: hold | close
+
+  if (signal?.action !== "close") return;
+
+  await commitClosePending(symbol);
+});
+```
+
+## Constants Doctrine
+
+Any constant tuned on a single month of backtest results is overfit — 15–18 trades prove nothing.
+
+**Order of precedence:**
+1. **Structural rules beat magic numbers.** Breakeven after 50% to TP1 closes the "almost-there" loss class with zero fitting — its parameter is tied to signal geometry, not to outcomes.
+2. **Numbers from process distributions, not from P&L.** Use `Log.debug` streams and `dump/log/log.jsonl` to build distributions of the process (drift ratios, stagnation trajectories) and derive thresholds from percentiles — not from which number made the equity curve look better.
+3. **Every candidate constant must survive walk-forward.** Extend the frame to 4–6 months in `modules/backtest.module.ts`, download the extra candles with `--cache`, and validate with `Sweep` (parameter grid) and `Walker` (optimize on window N, check on N+1) from backtest-kit.
+
+## Log Telemetry
+
+In production, `Log` calls are absent — the strategy is lean. When you need to tune thresholds or investigate behavior, copy the `Log.info` / `Log.debug` calls back from `main.test.ts`:
+
+- `Log.info` — rare state transitions: level reached, ratchet closed, breakeven set
+- `Log.debug` — dense measurement streams: drift on every active ping (only when `drift > 0`); stagnation every 15 minutes
+
+Records land in `dump/log/log.jsonl`. Key structure: `{ type, timestamp (backtest time), createdAt (wall time), topic, args: [payload] }`. Analysis scripts group by `topic` and `args[0].signalId`.
+
+```typescript
+Log.info("channel trailing level_up", {
+  signalId: data.id,
+  symbol: data.symbol,
+  position: data.position,
+  currentLevel,
+  levelPrice: levels[currentLevel - 1],
+  when: when.toISOString(),
+});
+```
+
+Payload rules: flat JSON, raw numbers (not formatted strings), always include a ratio field for the future threshold (`driftRatio = drift / step`), and the current limit (`driftRatioLimit`) so the log shows the threshold that was active when the record was written.
+
+## Running in Live Mode
+
+```bash
+npm start -- --live --ui --entry ./content/<channel>/main.strategy.ts
+```
+
+The `--live` and `--paper` flags in the loader are identical — both call `Live.background`. The difference between paper trading and real execution lives entirely in which exchange module is loaded.
+
+### live.module.ts
+
+`live.module.ts` is intentionally not provided in this project. Copy it from your own project that already has working exchange credentials and order execution. When integrating, verify:
+
+- `exchangeName` matches — use `"ccxt-exchange"` or ensure only one exchange module is loaded per run
+- Candle format: `{ timestamp, open, high, low, close, volume }`
+- `formatPrice` and `formatQuantity` return strings (same contract as `modules/backtest.module.ts`)
+
+The backtest and paper modules (`modules/backtest.module.ts`, `modules/paper.module.ts`) contain only data and formatting — no order execution methods. The live module adds those.
+
+## Checklist: Test → Production
+
+| Change | Value |
+|--------|-------|
+| Cache name | `<channel>_entry_v2` (increment from test) |
+| Cache interval | `"5m"` |
+| Scrape window | `limit: 15, dimension: "minute"` |
+| Freshness gate | `when - new Date(message.date) > 15 * 60_000 → null` |
+| Entry rule | Derived from channel format (not copied from another channel) |
+| Position management | Copied from `main.test.ts` snippets |
+| Constants | From process distributions, walk-forward validated |
+| Log calls | Remove for production, restore from `main.test.ts` when tuning |

@@ -1,0 +1,239 @@
+---
+title: "Backtest Engine: Signal Execution and Position Management"
+sidebarTitle: "Backtest Engine"
+description: "How backtest-kit replays strategies over 1m candles, the two entry patterns (getSignal and commitCreateSignal), and the level-ratchet trailing stop mechanism."
+---
+
+## How the Engine Replays Strategies
+
+The backtest engine in `backtest-kit` replays a strategy over 1-minute OHLCV candles within the defined frame. On each tick (each minute candle), it either calls `getSignal` (classic pattern) or fires `listenIdlePing` / `listenActivePing` listeners (event-driven pattern).
+
+The exchange schema (`modules/backtest.module.ts`) provides candles from MongoDB — pre-warmed by `--cache` — or falls back to live Binance API calls. The frame (`aug_2026_frame` in the shipped module) defines `startDate`, `endDate`, and `interval: "1m"`.
+
+## Two Entry Patterns
+
+### Pattern 1: Classic `getSignal` (crypto_yoda_channel)
+
+The strategy registers a `getSignal` function inside `addStrategySchema`. The framework calls it on every tick while no position is open, and opens a position when a non-null signal DTO is returned.
+
+```typescript
+addStrategySchema({
+  strategyName: "main_strategy",
+  getSignal: async (symbol, when) => {
+    const { entry, message, url } = await getSignal(symbol, when);
+
+    if (!entry || entry.position === "wait") return null;
+
+    // Freshness gate: reject posts older than 15 minutes
+    if (when.getTime() - new Date(message.date).getTime() > FRESH_WINDOW_MINUTES * 60_000) {
+      return null;
+    }
+
+    if (!entry.targets[2]) return null;
+
+    const priceTakeProfit = entry.position === "long"
+      ? Math.max(...entry.targets)
+      : Math.min(...entry.targets);
+
+    return {
+      id: `${entry.id}-${entry.symbol.toLowerCase()}`,
+      symbol: entry.symbol,
+      position: entry.position as Position,
+      priceStopLoss: entry.stoploss,
+      priceTakeProfit,
+      minuteEstimatedTime: Infinity,
+      payload: { levels: entry.targets },
+      note: JSON.stringify({ symbol, entry, message: omit(message, "photo"), url }, null, 2),
+    };
+  },
+});
+```
+
+The signal DTO fields:
+
+| Field | Description |
+|---|---|
+| `id` | Unique signal ID — typically `"postId-symbolLower"` |
+| `symbol` | Trading pair in `*USDT` format |
+| `position` | `"long"` or `"short"` |
+| `priceStopLoss` | Hard stop level |
+| `priceTakeProfit` | Take-profit level (use farthest target for the ratchet pattern) |
+| `minuteEstimatedTime` | Max open duration in minutes; `Infinity` = no time limit |
+| `payload` | Arbitrary object serialized into the backtest report |
+| `note` | Free-form string (JSON of entry + source post) stored in the report |
+
+### Pattern 2: Event-Driven `commitCreateSignal` via `listenIdlePing` (vershinin_trader)
+
+When the channel has no structured targets — the author just posts "I'm in" and "I'm out" — there is nothing for `getSignal` to return. Instead, the schema is registered empty, and entry is triggered from a listener:
+
+```typescript
+// Empty schema — no getSignal
+addStrategySchema({ strategyName: "main_strategy" });
+
+listenIdlePing(async ({ symbol, when, currentPrice }) => {
+  // listenIdlePing fires every minute while no position is open
+  const { signal, message, url } = await getOpenSignal(symbol, when);
+
+  if (!signal) return;
+  if (signal.position !== "long" && signal.position !== "short") return;
+
+  await commitCreateSignal(symbol, {
+    id: `${signal.id}-${signal.symbol.toLowerCase()}`,
+    symbol: signal.symbol,
+    ...Position.moonbag({
+      position: signal.position,
+      currentPrice,
+      percentStopLoss: HARD_STOP_PERCENT,   // 7.5% — author never publishes stops
+    }),
+    note: JSON.stringify({ signal, message: omit(message, "photo"), url }, null, 2),
+  });
+});
+```
+
+`commitCreateSignal` queues the DTO — the **next tick** consumes it as if it were returned from `getSignal`. The call is rejected if the symbol already has an open position or pending action.
+
+`Position.moonbag` is a helper for channels that provide no explicit targets or stops. It returns `{ position, priceTakeProfit, priceStopLoss }` where:
+- Take-profit is a fixed **+50%** from the current price (direction-aware) — effectively "ride until close signal"
+- Stop-loss is the given percentage (direction-aware)
+
+For custom TP/SL levels, use `Position.bracket` instead.
+
+**The LLM call inside any listener must be wrapped in `Cache.file`.** `listenIdlePing` fires every minute on every symbol. Without caching, this is a Telegram scrape and LLM call per minute per symbol — a fast path to rate limiting and runaway API costs.
+
+## `listenActivePing` and Position Management
+
+`listenActivePing` fires every tick **while a position is open**. It is the hook for all in-position management: ratchet logic, breakeven moves, LLM-driven close decisions.
+
+### Level-Ratchet Trailing Stop (crypto_yoda_channel)
+
+The ratchet treats each of the author's targets as a floor/ceiling. Once price crosses a level, any retrace beyond 30% of the local grid step closes the position.
+
+```typescript
+const LEVEL_DRIFT_RATIO = 0.3;
+
+function getCurrentLevel(position: Position, levels: number[], currentPrice: number) {
+  if (position === "long") {
+    return levels.filter((level) => currentPrice >= level).length;
+  }
+  return levels.filter((level) => currentPrice <= level).length;
+}
+
+function getLevelStep(levels: number[], lastLevel: number) {
+  const levelPrice = levels[lastLevel - 1];
+  const neighborPrice = lastLevel > 1 ? levels[lastLevel - 2] : levels[lastLevel];
+  return Math.abs(levelPrice - neighborPrice);
+}
+
+function getLevelDrift(position: Position, levels: number[], lastLevel: number, currentPrice: number) {
+  const levelPrice = levels[lastLevel - 1];
+  const drift = position === "long"
+    ? levelPrice - currentPrice
+    : currentPrice - levelPrice;
+  return Math.max(drift, 0);
+}
+
+listenActivePing(async ({ data, currentPrice }) => {
+  const levels = data.payload.levels as number[];
+  if (!levels?.length) return;
+
+  const currentLevel = getCurrentLevel(data.position as Position, levels, currentPrice);
+  const { lastLevel } = await LEVEL_STATE.getState();
+
+  if (currentLevel > lastLevel) {
+    // New level taken — update high-water mark
+    await LEVEL_STATE.setState({ lastLevel: currentLevel });
+    return;
+  }
+
+  if (!lastLevel) return; // No level taken yet — nothing to protect
+
+  const drift = getLevelDrift(data.position as Position, levels, lastLevel, currentPrice);
+  const step = getLevelStep(levels, lastLevel);
+
+  if (drift > step * LEVEL_DRIFT_RATIO) {
+    // Retrace exceeded 30% of the grid step — close
+    await commitClosePending(data.symbol);
+  }
+});
+```
+
+The 0.3 ratio is not fitted to PnL. It was derived from the empirical distribution of survived retraces over 62 events: the noise ceiling was 0.186, so any threshold in 0.2–0.3 leaves live positions untouched. The value 0.3 was chosen conservatively within that range.
+
+### LLM-Driven Close (vershinin_trader)
+
+The second channel has no grid — instead, `listenActivePing` fires a close pipeline that asks the model whether the author has posted a close announcement in the current 4-hour window:
+
+```typescript
+listenActivePing(async ({ symbol, when }) => {
+  const { signal } = await getCloseSignal(symbol, when);
+  if (!signal) return;
+  if (signal.action !== "close") return;
+
+  await commitClosePending(symbol, {
+    note: JSON.stringify({ signal, ... }, null, 2),
+  });
+});
+```
+
+The `PositionCloseFormat` schema has `action: { enum: ["hold", "close"] }`. `hold` covers everything except an explicit close: partial fixes, stop moves, breakevens, and noise posts.
+
+## Structural Breakeven Rule
+
+The `main.test.ts` variant adds a second `listenActivePing` listener that runs in parallel with the ratchet:
+
+```typescript
+const BREAKEVEN_TP1_PROGRESS = 0.5;
+
+listenActivePing(async ({ data, currentPrice, when }) => {
+  const levels = data.payload.levels as number[];
+  const { breakevenSet } = await BREAKEVEN_STATE.getState();
+
+  if (breakevenSet) return;
+
+  const progressToTp1 = getProgress(
+    data.position as Position,
+    data.priceOpen,
+    levels[0],
+    currentPrice,
+  );
+
+  if (progressToTp1 < BREAKEVEN_TP1_PROGRESS) return;
+
+  const moved = await commitBreakeven(data.symbol);
+  if (!moved) return;
+
+  await BREAKEVEN_STATE.setState({ breakevenSet: true });
+});
+```
+
+`commitBreakeven` moves the stop-loss to the entry price. After that call, the worst-case outcome for the position is breakeven (ignoring slippage). The rule is structural: it triggers at exactly 50% of the distance from entry to TP1, derived from the signal's own geometry — not from a threshold fitted to historical outcomes.
+
+Result on the one-month backtest: ratchet alone = **−0.31%**. Ratchet + breakeven = **+3.37%**. The gain came from converting 8 near-miss losses into zeros.
+
+## `State` — Per-Signal Storage
+
+`State` is a per-signal key-value container managed by backtest-kit. It resets automatically when the signal closes, so the `lastLevel` counter and `breakevenSet` flag start fresh for every new entry.
+
+```typescript
+const LEVEL_STATE = new State({
+  initialData: { lastLevel: 0 },
+  name: "level_state",
+});
+
+// Inside a listener:
+const { lastLevel } = await LEVEL_STATE.getState();
+await LEVEL_STATE.setState({ lastLevel: currentLevel });
+```
+
+Prefer instance methods (`state.getState()` / `state.setState()`) over the static variants (`_getState` / `_setState`). Do not call `State.enable()` — `@backtest-kit/cli` handles that.
+
+## `Cache.file` — Deduplication and MongoDB Persistence
+
+`Cache.file` serves two purposes:
+
+1. **Deduplication** — prevents redundant Telegram scrapes and LLM calls within the same time bucket
+2. **Persistence** — every cache entry (including `null` results) is written to the `measure-items` MongoDB collection
+
+The bucket name is `"<name>_<interval>_0"` — for example, `"crypto_yoda_entry_v3_5m_0"`. This is the key used by `read-cache.mjs` and `event-study.mjs` to query signal history.
+
+**Always change the cache name when changing the schema, prompt, or post-selection logic.** Old entries under the previous name would be served from cache and silently corrupt the new run.

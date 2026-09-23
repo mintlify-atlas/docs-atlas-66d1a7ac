@@ -1,0 +1,261 @@
+---
+title: "Step 2: Design the LLM Prompt and Schema from Real Posts"
+sidebarTitle: "Prompt Design"
+description: "Write prompt.mustache and the FormatModel JSON schema from the author's actual posts, then debug inline with generateObject before touching strategy code."
+---
+
+## Everything Comes from the Channel's Posts
+
+The prompt and schema are designed from what you saw in Step 1 — not from a generic template. The crypto_yoda channel (range entry + 5 targets + stop) is a worked example; a channel with one target, percentage-based targets, or direction-only signals will have a different schema.
+
+## Prompt Structure (prompt.mustache)
+
+The prompt follows a consistent structure, but **examples and filter rules come from THIS channel's posts**:
+
+1. **Who you are**: establish the auditor framing — "я провожу аудит торговых рекомендаций профессионального трейдера"
+2. **What to return**: entries for ticker `{{symbol}}` only
+3. **Real signal example from this channel**: paste an actual post from Step 1 as the positive example
+4. **What to filter**: paste an actual non-signal post (result report, ad) and tell the model to exclude it
+
+Here is the full `prompt.mustache` from crypto_yoda as a reference for the range + 5-targets + stop format:
+
+```mustache
+# Руководство
+
+Я провожу аудит торговых рекомендаций профессионального трейдера. 
+Мне нужно преобразовать его рекомендацию из текстового формата в JSON структуру.
+
+Возвращай только позиции для тикера `{{symbol}}`
+
+Из предоставленных сообщений найди его входы в позицию, например
+
+```
+СИГНАЛ #BTC/USDT
+
+📛 Риск сигнала: 6/10
+
+🔑 Открыть ЛОНГ в диапазоне $78600 - $79400 - 6% депозита, плечо X15
+
+🍒 Цели:
+
+🔘 Закрыть по $80300
+🔘 Закрыть по $80900
+🔘 Закрыть по $82000
+🔘 Закрыть по $83200
+🔘 Закрыть по $84500
+
+❗️ СТОП ЛОСС: $77400
+` ` `
+
+Верни именно входы, публикации о результате работ фильтруй.
+
+` ` `
+#BTC/USDT
+Тейк-профит 1 ✅
+Тейк-профит 2 ✅
+Тейк-профит 3 ✅
+Тейк-профит 4 ✅
+
+Прибыль: 53.2296% 📈
+Период: 1 день 10 часов ⏰
+` ` `
+
+Шаблоны произвольные, общий вид такой
+```
+
+Replace the example posts with posts from the actual channel you are onboarding.
+
+## FormatModel Schema Design Rules
+
+The schema is a JSON object passed as the `format` field to `generateObject` from `json-inference`.
+
+**Structure rules:**
+- Flat object: `{ type: "object", required: [...], properties: {...} }`
+- Arrays **must** have `items: { type: "number" }` (or the appropriate type). Without `items`, the model returns a mix of numbers and strings — the bug is silent and hard to spot
+- Nested objects are supported: `entryRange: { from, to }` works correctly
+- No defaults in the schema — put fallback instructions in the field `description`: "if no signal, return -1 / 0 / [] / wait"
+- `enum` is valid only on string fields
+
+**Required fields in every schema:**
+- `id` — message ID (number; `-1` when no signal)
+- `reasoning` — string; used for debugging; the model explains its decision
+- A "no signal" exit path — `position: "wait"` or `action: "hold"`
+
+**About json-inference:**
+json-inference is the fix for broken structured output in ollama. The `format` parameter at the ollama level is not applied for cloud models — they respond with a markdown fence (`` ```json ... ``` ``) or a plain array, and `JSON.parse` fails. json-inference passes the schema as tool-call parameters (`provide_answer`), forces the model into valid tool-call grammar, and recursively validates and retries on mismatch. Always call the LLM through `generateObject` or `generateText` from json-inference — never directly via `ollama.chat` with `format`.
+
+json-inference also adds a `_context` field to results. Ignore it — it's internal bookkeeping.
+
+## The TradingPositionFormat from crypto_yoda
+
+This is the complete real schema for the range + 5-targets + stop format:
+
+```typescript
+import { type FormatModel } from "json-inference";
+import { str } from "functools-kit";
+
+const TradingPositionFormat = {
+  type: "object",
+  required: [
+    "id",
+    "symbol",
+    "position",
+    "entryRange",
+    "targets",
+    "stoploss",
+    "reasoning",
+  ],
+  properties: {
+    id: {
+      type: "number",
+      description: str.newline(
+        "ID сообщения из которого был сформирован сигнал.",
+        "Это число, пиши только его без строкового префикса ID, например, 2134.",
+        "Если сигнала нет, верни -1",
+      ),
+    },
+    symbol: {
+      type: "string",
+      description: str.newline(
+        "Тикер позиции строго в формате *USDT, Например",
+        "Текст #BTC/USDT преобразуем в BTCUSDT без # и /",
+      ),
+    },
+    position: {
+      type: "string",
+      enum: ["long", "short", "wait"],
+      description: "Тип позиции, long или short. Если позиции нет, верни wait",
+    },
+    entryRange: {
+      type: "object",
+      description: str.newline(
+        "Диапазон входа в позицию, например для 'в диапазоне $78600 - $79400'",
+        "верни from=78600, to=79400. Если сигнала нет, верни from=0 и to=0",
+      ),
+      required: ["from", "to"],
+      properties: {
+        from: {
+          type: "number",
+          description: "Цена входа ОТ",
+        },
+        to: {
+          type: "number",
+          description: "Цена входа ДО",
+        },
+      },
+    },
+    targets: {
+      type: "array",
+      description: "Цели позиции, 5 уровней, числа. Если сигнала нет, верни []",
+      items: { type: "number" },
+    },
+    stoploss: {
+      type: "number",
+      description: "СТОП ЛОСС, одна точка хард стоп. Если сигнала нет, верни 0",
+    },
+    reasoning: {
+      type: "string",
+      description: str.newline(
+        "Строковое описание почему ты сделал именно такое решение",
+        "Будет использовано программистом для отладки",
+      ),
+    },
+  },
+} satisfies FormatModel;
+```
+
+A channel with one target, percentage targets, or direction-only signals will have a simpler schema — derive it from what you saw in Step 1.
+
+## Inline Debugging: Reproduce the Exact Pipeline
+
+Before touching strategy code, validate the prompt and schema with a temporary script that runs the **exact** pipeline: same prompt rendered with Mustache, same schema, same message structure with ID / date / link.
+
+```js
+// debug.tmp.mjs — run from content/<channel_name>/
+import { scrapePage } from "telegram-reader";
+import { generateObject, InferenceName } from "json-inference";
+import { str } from "functools-kit";
+import { readFile } from "fs/promises";
+import Mustache from "mustache";
+
+const CHANNEL_NAME = "<channel_name>";
+const symbol = "BTCUSDT";
+
+const template = await readFile("./prompt.mustache", "utf-8");
+const renderedPrompt = Mustache.render(template, { symbol });
+
+const messages = await scrapePage({
+  channel: CHANNEL_NAME,
+  limit: 20,
+  offset: 0,
+  when: new Date("2027-01-01T00:00:00Z"),
+});
+
+const result = await generateObject(
+  InferenceName.OllamaInference,
+  {
+    format: TradingPositionFormat,
+    messages: [
+      { role: "user", content: renderedPrompt },
+      ...messages.map(({ id, channel, date, content }) => ({
+        role: "user",
+        content: str.newline(`ID ${id}`, "", content, "", `[${date.toISOString()}]: https://t.me/${channel}/${id}`),
+      })),
+    ],
+  },
+  "gemma4:31b-cloud",
+);
+
+console.log(JSON.stringify(result, null, 2));
+```
+
+Do not simplify the pipeline — bugs often live in the message assembly, not in the schema itself. Use exactly the same message structure that the strategy will use.
+
+<Tip>
+Name temporary scripts `*.tmp.mjs` so they're easy to find and delete after debugging. Run them with `node debug.tmp.mjs | grep -v "resize begin"` from the channel folder.
+</Tip>
+
+## Vision Channels: Images in Messages
+
+If the channel posts signals as chart screenshots or exchange cards, pass the image to the model via `images`:
+
+```js
+messages.map(({ id, channel, date, content, photo }) => ({
+  role: "user",
+  content: str.newline(`ID ${id}`, "", content, "", `[${date.toISOString()}]: https://t.me/${channel}/${id}`),
+  ...(photo && { images: [photo] }),
+}))
+```
+
+`photo` is a base64 JPEG preview (800px) on the `ScraperMessage` object. `gemma4:31b-cloud` reads charts correctly — tested on Glassnode charts and TradingView / BYDFi position cards.
+
+<Warning>
+**The green P&L trap.** On exchange position cards, green numbers mean profit — not long direction. A short position in profit shows green. Write the direction rule explicitly in the prompt: "determine direction only from the words Long/Short or from the relative positions of take-profit and stop-loss zones, not from color."
+
+Always download and look at real photos with `assets/download-photos.mjs` before writing any vision rules in the prompt. Never guess what the images show.
+</Warning>
+
+Adding images changes the LLM input → **always use a new cache name** when enabling vision.
+
+## Mandatory Test Cases Before Moving On
+
+Run the debug script on these cases and verify all pass before proceeding to Step 3:
+
+| Post type | Expected result |
+|-----------|----------------|
+| Every signal type the channel posts | All fields extracted; numbers as numbers; direction correct; `id` matches the source post |
+| Result reports (take-profit announcements) | `position: "wait"` |
+| Ads, commentary, analytics without a signal | `position: "wait"` |
+| Window with no relevant symbol | `position: "wait"` with `id: -1` |
+
+For the vershinin dual-pipeline pattern (open + close), the `assets/validate.mjs` script codifies these as `PASS/FAIL` cases and exits with code `1` on any failure. Run it after every prompt or schema change.
+
+## Cache Name Change Rule
+
+Any change to the schema or to the logic that selects which posts reach the LLM requires a **new cache name**. Old cached responses from `Cache.file` are keyed by `{name}_{interval}` — if you reuse the name, stale model responses from the previous schema pollute the new run.
+
+Increment the version suffix: `channel_entry_v1` → `channel_entry_v2` → `channel_entry_v3`.
+
+## Next Step
+
+Once every test case passes stably, you have a validated prompt and schema. Proceed to [Step 3: Run the Test Strategy Over a Full Month](/guides/test-strategy).

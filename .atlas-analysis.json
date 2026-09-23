@@ -1,0 +1,122 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "backtest-ollama-casual",
+  "projectDescription": "A measurement rig for Telegram signal channels that uses an Ollama LLM (gemma4:31b-cloud via json-inference) to parse each author's trading guidance from text and chart screenshots, executes signals within minutes of publication, and runs event studies over minute candles to reveal where the edge actually lives.",
+  "theme": "luma",
+  "primaryColor": "#1f70c2",
+  "lightColor": null,
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/llm-as-parser",
+              "concepts/backtest-engine",
+              "concepts/event-study"
+            ]
+          },
+          {
+            "group": "Signal Channels",
+            "pages": [
+              "channels/crypto-yoda",
+              "channels/vershinin-trader"
+            ]
+          },
+          {
+            "group": "Adding a New Channel",
+            "pages": [
+              "guides/read-posts",
+              "guides/prompt-design",
+              "guides/test-strategy",
+              "guides/production-strategy"
+            ]
+          },
+          {
+            "group": "Infrastructure",
+            "pages": [
+              "infrastructure/configuration",
+              "infrastructure/docker-mongodb",
+              "infrastructure/dump-format"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "API Reference",
+            "pages": [
+              "reference/backtest-kit-api",
+              "reference/json-inference",
+              "reference/telegram-reader",
+              "reference/forensics-scripts"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "reference/loader-config",
+              "reference/modules",
+              "reference/constants"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "LLM-powered Telegram signal parsing using gemma4:31b-cloud via json-inference tool-grammar for deterministic structured output",
+    "Supports both text-only and vision (chart screenshot) signal formats via Ollama multimodal inference",
+    "Level-ratchet trailing stop that adapts to the grid density of each signal channel",
+    "Dual LLM pipeline for channels where entry and close are separate posts (listenIdlePing + listenActivePing)",
+    "Event study toolkit: directional price moves at +15m/+1h/+4h/+12h/+24h after each signal, pre-post drift, zone touch analysis",
+    "Cache.file for LLM result persistence (5m/4h interval) to avoid redundant Telegram scrapes and model calls",
+    "Per-signal State for ratchet level tracking, breakeven management, and stagnation telemetry",
+    "Docker + MongoDB + Redis infrastructure for candle caching and LLM result persistence",
+    "Prompt regression suite (validate.mjs) with mandatory cases that fail fast on prompt changes"
+  ],
+  "publicApiSurface": [
+    "npm start -- --backtest --ui --entry <strategy.ts>",
+    "npm start -- --backtest --ui --entry <strategy.ts> --cache",
+    "npm start -- --live --ui --entry <strategy.ts>",
+    "npm start -- --paper --ui --entry <strategy.ts>",
+    "addStrategySchema({ strategyName, getSignal? })",
+    "addExchangeSchema({ exchangeName, getCandles, getOrderBook, formatPrice, formatQuantity })",
+    "addFrameSchema({ frameName, interval, startDate, endDate })",
+    "Cache.file(fn, { interval, name })",
+    "State({ initialData, name })",
+    "listenIdlePing(callback)",
+    "listenActivePing(callback)",
+    "listenError(callback)",
+    "commitCreateSignal(symbol, dto)",
+    "commitClosePending(symbol, opts?)",
+    "commitBreakeven(symbol)",
+    "commitSignalNotify(symbol, opts)",
+    "Position.moonbag({ position, currentPrice, percentStopLoss })",
+    "Position.bracket({ position, priceOpen, priceTakeProfit, priceStopLoss })",
+    "generateObject(inferenceName, params, model)",
+    "generateText(inferenceName, params, model)",
+    "scrapeLookback({ channel, limit, dimension, when })",
+    "scrapePage({ channel, limit, offset, when })",
+    "scrapeDay({ channel, date })",
+    "signIn()",
+    "node assets/event-study.mjs <bucket>",
+    "node assets/read-cache.mjs",
+    "node assets/read-posts.mjs",
+    "node assets/validate.mjs",
+    "node assets/download-photos.mjs"
+  ]
+}

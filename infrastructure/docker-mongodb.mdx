@@ -1,0 +1,179 @@
+---
+title: "Docker, MongoDB, and Redis Infrastructure Setup"
+sidebarTitle: "Docker & MongoDB"
+description: "Start the MongoDB and Redis services required by backtest-kit, connect to the database to inspect LLM cache and candle data, and understand what each collection stores."
+---
+
+## Required Services
+
+backtest-kit needs two services running locally before any backtest or live session:
+
+| Service | Port | Used for |
+|---|---|---|
+| **MongoDB** | 27017 | LLM cache (`measure-items`) and candle storage (`candle-items`) |
+| **Redis** | 6379 | backtest-kit internal state |
+
+## Starting the Services
+
+Each service has its own Compose file under `docker/`.
+
+### MongoDB
+
+```bash
+docker-compose -f docker/mongo/docker-compose.yaml up -d
+```
+
+This starts `mongodb/mongodb-community-server:8.0.4-ubi8` with data persisted to `docker/mongo/mongo_data/`.
+
+### Redis
+
+```bash
+docker-compose -f docker/redis/docker-compose.yaml up -d
+```
+
+This starts `redis:7.4.1` with password `mysecurepassword` and data persisted to `docker/redis/redis_data/`.
+
+### Full Dev Environment
+
+The root `docker-compose.yaml` starts the full devenv image (`tripolskypetr/devenv`) which mounts the entire project:
+
+```bash
+docker-compose up -d
+```
+
+This is for running the complete environment inside Docker. For local development, bring up only MongoDB and Redis separately.
+
+## Connecting to MongoDB
+
+```
+mongodb://localhost:27017/backtest-kit
+```
+
+For ad-hoc inspection in a Node script, use mongoose (it is already in the project's dependencies):
+
+```js
+import mongoose from "mongoose";
+
+const conn = await mongoose
+  .createConnection("mongodb://localhost:27017/backtest-kit")
+  .asPromise();
+const db = conn.getClient().db("backtest-kit");
+```
+
+## Collections
+
+### `measure-items` — LLM Cache
+
+Every `Cache.file` or `Cache.fn` call persists its result here. Fields:
+
+| Field | Example | Description |
+|---|---|---|
+| `bucket` | `"crypto_yoda_entry_v3_5m_0"` | Cache name + interval + shard, set by the strategy. |
+| `entryKey` | `"BTCUSDT_1753920300000"` | `"SYMBOL_timestamp"` — the cache lookup key (tick time in ms). |
+| `payload.data` | `{ entry: {...}, message: {...} }` | Whatever the wrapped function returned. `entry: null` means the LLM window was empty or returned no signal. |
+
+The bucket name encodes the cache version and interval (e.g. `_5m_`). Whenever you change the LLM schema or post-selection logic, **change the cache name** to avoid mixing old and new responses.
+
+### `candle-items` — 1m OHLCV
+
+Populated by `--cache` warm-up runs. Fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `symbol` | string | e.g. `"BTCUSDT"` |
+| `interval` | string | Always `"1m"` |
+| `timestamp` | number (ms) | Candle open time |
+| `open` / `high` / `low` / `close` | number | OHLC prices |
+| `volume` | number | Traded volume |
+
+## Useful Queries
+
+### List all buckets with record counts
+
+```js
+const buckets = await db
+  .collection("measure-items")
+  .aggregate([
+    { $group: { _id: "$bucket", count: { $sum: 1 } } },
+  ])
+  .toArray();
+
+for (const b of buckets) {
+  console.log(`${b._id}: ${b.count} records`);
+}
+```
+
+### Get all non-null LLM verdicts from a specific bucket
+
+```js
+const docs = await db
+  .collection("measure-items")
+  .find({
+    bucket: "crypto_yoda_entry_v3_5m_0",
+    "payload.data.entry.position": { $in: ["long", "short"] },
+  })
+  .sort({ entryKey: 1 })
+  .toArray();
+
+for (const d of docs) {
+  const e = d.payload.data.entry;
+  const [symbol, ts] = d.entryKey.split("_");
+  const when = new Date(parseInt(ts)).toISOString().slice(0, 16);
+  console.log(symbol, when, e.position, `post=${e.id}`);
+}
+```
+
+### Fetch a single 1m candle for a symbol at a specific timestamp
+
+```js
+const candle = await db
+  .collection("candle-items")
+  .findOne({ symbol: "BTCUSDT", interval: "1m", timestamp: 1753920300000 });
+
+console.log(candle?.close);   // closing price of that minute
+```
+
+### Fetch candles over a 24-hour range (event study window)
+
+```js
+const t0 = 1753920300000;     // signal timestamp in ms
+const t1 = t0 + 1440 * 60_000; // +24 hours
+
+const candles = await db
+  .collection("candle-items")
+  .find({
+    symbol: "BTCUSDT",
+    interval: "1m",
+    timestamp: { $gte: t0, $lte: t1 },
+  })
+  .sort({ timestamp: 1 })
+  .toArray();
+```
+
+Use the same pattern with a negative offset (`t0 - h * 60_000`) to look at price action **before** the signal (pre-drift analysis).
+
+## Asset Scripts
+
+Two ready-made scripts in `content/crypto_yoda_channel/assets/` wrap these patterns:
+
+**`assets/read-cache.mjs`** — inspect `measure-items`. Run without arguments to list all buckets; pass a bucket name to print every non-null LLM verdict:
+
+```bash
+# list all buckets and record counts
+node assets/read-cache.mjs
+
+# print all non-null verdicts from a specific bucket
+node assets/read-cache.mjs crypto_yoda_entry_v3_5m_0
+```
+
+**`assets/event-study.mjs`** — directional price move after each signal, across horizons 15m / 1h / 4h / 12h / 24h, plus pre-drift before the post. Requires both `measure-items` (signals) and `candle-items` (candles):
+
+```bash
+node assets/event-study.mjs crypto_yoda_entry_v3_5m_0
+```
+
+Output includes per-signal rows and a summary table of mean, median, and hit-rate at each horizon. The finding for crypto-yoda: edge lives at 12–24h, pre-drift is ~50% (author is not simply posting along the trend).
+
+<Note>
+**Disk space.** `performance.jsonl` can reach hundreds of megabytes per backtest run — it is generated for profiling only and is not needed for trade analysis. `backtest.jsonl` is also large because `idle` events (ticks without an open position) dominate by volume — roughly 98 % of lines. Filter them out before loading the file into memory.
+</Note>

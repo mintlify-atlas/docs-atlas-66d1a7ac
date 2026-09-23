@@ -1,0 +1,361 @@
+---
+title: "json-inference: Structured Ollama Output That Actually Works"
+sidebarTitle: "json-inference"
+description: "API reference for json-inference 1.1.0: generateObject, generateText, FormatModel schema rules, InferenceName, and vision (images) support for multimodal models."
+---
+
+```typescript
+import {
+  generateObject,
+  generateText,
+  InferenceName,
+  type FormatModel,
+} from "json-inference";  // version 1.1.0
+```
+
+---
+
+## The Problem It Solves
+
+Ollama's built-in `format` parameter does not reliably work for cloud-tier models. When `format: { ... }` is passed directly to `ollama.chat`, these models return markdown-fenced output or plain arrays instead of a JSON object:
+
+```
+```json
+[]
+```
+```
+
+`JSON.parse` throws, and the strategy crashes.
+
+**json-inference solves this by passing the schema as `provide_answer` tool-call parameters.** The tool grammar in the inference engine forces the model to return a structurally valid JSON object. The library then recursively validates the response against the schema and retries on any mismatch.
+
+**Key properties:**
+- Numeric fields are deterministic — the model copies them from the source post
+- Free-text fields like `reasoning` vary between runs (language, phrasing)
+- The model is NOT fully deterministic: always compare all fields (including `reasoning`) when diffing two cache runs
+- `_context` is appended automatically by json-inference to every response — ignore it in strategy code
+
+**Rule:** Always call LLMs via `generateObject` or `generateText` from `json-inference`. Never call `ollama.chat` with `format` directly.
+
+---
+
+## `generateObject`
+
+Calls the model and returns a typed object that matches the `FormatModel` schema. Retries internally on schema mismatch.
+
+```typescript
+generateObject<T>(
+  inferenceName: InferenceName,
+  params: {
+    format: FormatModel;
+    messages: Array<{
+      role: "user";
+      content: string;
+      images?: string[];   // base64 JPEG strings for vision
+    }>;
+  },
+  model: string
+): Promise<T>
+```
+
+<ParamField path="inferenceName" type="InferenceName" required>
+  Always use `InferenceName.OllamaInference` for this project.
+</ParamField>
+
+<ParamField path="params.format" type="FormatModel" required>
+  The JSON schema that defines the response structure. See [FormatModel Schema Rules](#formatmodel-schema-rules).
+</ParamField>
+
+<ParamField path="params.messages" type="Array" required>
+  Conversation messages. The first message is typically the system/instruction prompt; subsequent messages are the posts from the channel. Include `images` for vision-capable models.
+</ParamField>
+
+<ParamField path="model" type="string" required>
+  Model identifier. Use `"gemma4:31b-cloud"` in this project.
+</ParamField>
+
+```typescript
+const entry = await generateObject(
+  InferenceName.OllamaInference,
+  {
+    format: TradingPositionFormat,
+    messages: [
+      { role: "user", content: await getPrompt(symbol) },
+      ...messages.map(({ id, channel, date, content }) => ({
+        role: "user" as const,
+        content: str.newline(
+          `ID ${id}`,
+          "",
+          content,
+          "",
+          `[${date.toISOString()}]: https://t.me/${channel}/${id}`,
+        ),
+      })),
+    ],
+  },
+  "gemma4:31b-cloud",
+);
+```
+
+---
+
+## `generateText`
+
+Calls the model and returns a plain string. No schema validation.
+
+```typescript
+generateText(
+  inferenceName: InferenceName,
+  params: {
+    messages: Array<{
+      role: "user";
+      content: string;
+      images?: string[];
+    }>;
+  },
+  model: string
+): Promise<string>
+```
+
+<ParamField path="inferenceName" type="InferenceName" required>
+  Always `InferenceName.OllamaInference`.
+</ParamField>
+
+<ParamField path="params.messages" type="Array" required>
+  Conversation messages. Same shape as `generateObject`.
+</ParamField>
+
+<ParamField path="model" type="string" required>
+  Model identifier.
+</ParamField>
+
+---
+
+## `InferenceName`
+
+```typescript
+enum InferenceName {
+  OllamaInference = "OllamaInference",
+}
+```
+
+Always use `InferenceName.OllamaInference` in this project.
+
+---
+
+## `FormatModel`
+
+TypeScript type for the JSON schema object passed to `generateObject`. The `satisfies FormatModel` check at compile time confirms the schema is structurally valid.
+
+```typescript
+const MyFormat = {
+  type: "object",
+  required: [...],
+  properties: { ... },
+} satisfies FormatModel;
+```
+
+---
+
+## FormatModel Schema Rules
+
+These rules were established through A/B testing on real posts and model runs. Violating them causes the model to return inconsistent types or fall back to string representations.
+
+### Flat top-level object
+
+The schema root must always be:
+
+```json
+{
+  "type": "object",
+  "required": ["field1", "field2"],
+  "properties": { ... }
+}
+```
+
+### Arrays must declare `items`
+
+Without `items`, the model may return a mix of strings and numbers:
+
+```json
+// ✅ correct
+"targets": {
+  "type": "array",
+  "items": { "type": "number" },
+  "description": "..."
+}
+
+// ❌ wrong — model returns ["79400", 80000, "81k"]
+"targets": {
+  "type": "array",
+  "description": "..."
+}
+```
+
+Supported item types: `{ "type": "number" }` and `{ "type": "string" }`.
+
+### Nested objects are supported
+
+```json
+"entryRange": {
+  "type": "object",
+  "required": ["from", "to"],
+  "properties": {
+    "from": { "type": "number", "description": "Entry price FROM" },
+    "to":   { "type": "number", "description": "Entry price TO" }
+  }
+}
+```
+
+### No defaults in schema
+
+Do not use JSON Schema `default` values. Instead, put the fallback instruction in the field's `description`:
+
+```json
+// ✅ correct
+"stoploss": {
+  "type": "number",
+  "description": "Hard stop-loss price. If no signal, return 0"
+}
+
+// ❌ wrong — model may ignore schema-level defaults
+"stoploss": {
+  "type": "number",
+  "default": 0
+}
+```
+
+### Mandatory fields in every schema
+
+Every `FormatModel` schema must include:
+
+| Field | Purpose |
+|---|---|
+| `id` (`number`) | ID of the source post. `description` must say: "if no signal, return -1". After the call, verify `messages.find(m => m.id === result.id)` exists. |
+| `reasoning` (`string`) | Free-text explanation for debugging. Required even in production. |
+| A "no signal" exit path | `position: { enum: ["long", "short", "wait"] }` or `action: { enum: ["hold", "close"] }`. The strategy ignores `"wait"` or `"hold"` responses. |
+
+### `enum` only on string fields
+
+```json
+// ✅ correct
+"position": {
+  "type": "string",
+  "enum": ["long", "short", "wait"]
+}
+
+// ❌ wrong — enum on number fields is unsupported
+"side": {
+  "type": "number",
+  "enum": [1, -1]
+}
+```
+
+### The `_context` field
+
+json-inference appends a `_context` field to every response object. It is not part of the schema and should be ignored in strategy code. Do not include it in signal `note` or cache entries.
+
+---
+
+## Real Example: `TradingPositionFormat`
+
+The complete schema used in `crypto_yoda_channel` for parsing trade signals (entry range + 5 targets + stop-loss):
+
+```typescript
+const TradingPositionFormat = {
+  type: "object",
+  required: [
+    "id",
+    "symbol",
+    "position",
+    "entryRange",
+    "targets",
+    "stoploss",
+    "reasoning",
+  ],
+  properties: {
+    id: {
+      type: "number",
+      description: str.newline(
+        "ID сообщения из которого был сформирован сигнал.",
+        "Это число, пиши только его без строкового префикса ID, например, 2134.",
+        "Если сигнала нет, верни -1",
+      ),
+    },
+    symbol: {
+      type: "string",
+      description: str.newline(
+        "Тикер позиции строго в формате *USDT, Например",
+        "Текст #BTC/USDT преобразуем в BTCUSDT без # и /",
+      ),
+    },
+    position: {
+      type: "string",
+      enum: ["long", "short", "wait"],
+      description: "Тип позиции, long или short. Если позиции нет, верни wait",
+    },
+    entryRange: {
+      type: "object",
+      description: str.newline(
+        "Диапазон входа в позицию, например для 'в диапазоне $78600 - $79400'",
+        "верни from=78600, to=79400. Если сигнала нет, верни from=0 и to=0",
+      ),
+      required: ["from", "to"],
+      properties: {
+        from: { type: "number", description: "Цена входа ОТ" },
+        to:   { type: "number", description: "Цена входа ДО" },
+      },
+    },
+    targets: {
+      type: "array",
+      description: "Цели позиции, 5 уровней, числа. Если сигнала нет, верни []",
+      items: { type: "number" },   // required — without this model returns mixed types
+    },
+    stoploss: {
+      type: "number",
+      description: "СТОП ЛОСС, одна точка хард стоп. Если сигнала нет, верни 0",
+    },
+    reasoning: {
+      type: "string",
+      description: str.newline(
+        "Строковое описание почему ты сделал именно такое решение",
+        "Будет использовано программистом для отладки",
+      ),
+    },
+  },
+} satisfies FormatModel;
+```
+
+For a channel that provides only direction (no levels), the schema is simpler — `targets`, `entryRange`, and `stoploss` are dropped. Design the schema from the channel's actual post format, not from this template.
+
+---
+
+## Vision / Images
+
+Pass base64 JPEG images in the `images` field of a message object. Works with both `generateObject` and `generateText`.
+
+```typescript
+messages.map(({ id, channel, date, content, photo }) => ({
+  role: "user" as const,
+  content: str.newline(
+    `ID ${id}`,
+    "",
+    content,
+    "",
+    `[${date.toISOString()}]: https://t.me/c/${channel.slice(4)}/${id}`,
+  ),
+  ...(photo && { images: [photo] }),   // attach photo if present
+})),
+```
+
+<ParamField path="images" type="string[]">
+  Array of base64-encoded JPEG strings. The `photo` field on `ScraperMessage` (from `telegram-reader`) is already base64 JPEG at 800px — pass it directly.
+</ParamField>
+
+**Rules:**
+
+- **Write vision rules in prompts only after looking at real images** — use `assets/download-photos.mjs` to download samples and inspect them manually. Different channels have different image types (TradingView position tool zones, BYDFi share cards, P&L screenshots).
+- **Green color in P&L images means profit, not long direction.** A short position in profit shows green numbers. State direction rules in the prompt explicitly (e.g. "determine direction only from the word Long/Short or from the relative position of take-profit and stop-loss zones").
+- Adding images changes the model input → **change the cache name** (`name` in `Cache.file` opts) whenever you add or remove image support.
+- Images are heavy (~50 KB per post). For wide time windows, monitor LLM latency.
+- Never include `photo` in the signal `note` field: `omit(message, "photo")` before serializing.

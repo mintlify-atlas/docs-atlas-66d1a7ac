@@ -1,0 +1,561 @@
+---
+title: "vershinin_trader: Vision Signals with Dual LLM Pipelines"
+sidebarTitle: "Vershinin Trader"
+description: "Strategy for a private Telegram channel using TradingView screenshots and exchange position cards. Two independent LLM pipelines handle entry discovery and close decision separately."
+---
+
+## Overview
+
+`vershinin_trader` is a fundamentally different kind of signal channel. There are no entry ranges, no target grids, no stops in the posts. The author enters "at current levels", posts charts and exchange position cards as images, announces closes in separate text posts, and sometimes announces mass-closes of all positions at once. The strategy handles this format with **two independent LLM pipelines**: one that scans for a new entry, and one that watches for the author's close announcement.
+
+Source lives in `content/vershinin_trader/`.
+
+<Note>
+The `session.txt` Telegram auth file is shared between channels — it can be copied directly from `content/crypto_yoda_channel/`. One authorization covers all channels on the same account.
+</Note>
+
+---
+
+## Channel Format and What Makes It Different
+
+Unlike structured channels, vershinin_trader posts are conversational. There are no uniform templates, no hashtag prefixes on tickers, and no machine-readable price levels. The author may indicate direction with a single sentence, or leave it entirely to the attached image.
+
+### Entry posts (`position = long | short`)
+
+Text-only entries:
+
+```
+Работаю с ETH — в лонг с текущих значений, моя точка входа 2750$,
+цель ожидаю 2825$, стоп поставил 2715$, плечо 100х
+```
+
+```
+Еще и 1000PEPE беру так же в лонг с текущих, на 3-4% вверх!
+```
+
+```
+Работаю с SOL — в шорт
+(+ карточка BYDFi: «SOLUSDT Бессрочный, Шорт | 50x»)
+```
+
+```
+🤑ETH — можно рассмотреть кто без сделки.
+(+ график с зоной тейка над входом = long)
+```
+
+Ticker format: bare coin names without a pair or `#` prefix — `BTC`, `ETH`, `1000PEPE`, `VIRTUAL`, `SOL`. The strategy normalises these to `BTCUSDT`, `ETHUSDT`, `1000PEPEUSDT`, etc. The author's stated leverage (50x–100x) is ignored entirely.
+
+### Close post (`action = close`)
+
+```
+❗️МОИ ШОРТЫ НА BYBIT ПРИНИМАЮ РЕШЕНИЕ ЗАКРЫТЬ, ПРИНЯТЬ УБЫТКИ И ДВИГАТЬСЯ ДАЛЬШЕ!
+```
+
+A mass-close announcement covers all open positions. The close pipeline fires `commitClosePending` for the tracked symbol regardless of which specific asset is mentioned in the text.
+
+### Non-signals (`wait` / `hold`)
+
+The following post types must _not_ trigger an entry or close:
+
+- **Partial take / stop management**: "50% фиксанул, остальное в б/у", "стоп передвинул на 2705$", "часть фиксируйте, стоп на точку входа" — position remains open.
+- **Analytics and expectations**: "хочу увидеть снятие 5.3$", market breakdowns, "Мысли по BTC нужны?"
+- **News and calendars**: "Экономические новости… Трамп выступает"
+- **Ads and invitations**: VIP channel promos, #реклама tags, "пишите @alex_vershin"
+- **Imageless posts**: a post with no text typically continues an album from the previous post.
+
+---
+
+## The Three Image Types
+
+The channel posts three distinct types of images. All of them are sent to the model via `images` in the messages array. Vision rules were written after literally looking at real photos via `assets/download-photos.mjs` — not from imagination.
+
+### 1. TradingView position tool chart
+
+A chart with two coloured rectangles overlaid:
+- **Green rectangle** = take-profit zone
+- **Red rectangle** = stop-loss zone
+- The ticker appears in the chart header (e.g. `BTCUSDT Perpetual Contract`)
+- **Green zone ABOVE the entry line = long; green zone BELOW = short**
+
+### 2. BYDFi share card
+
+A branded card from the BYDFi exchange. The direction is written as text directly on the card:
+
+```
+VIRTUALUSDT Бессрочный, Лонг | 50X
+SOLUSDT Бессрочный, Шорт | 50x
+```
+
+Card styling varies (light/dark, with referral code), but the ticker and Лонг/Шорт are always present.
+
+### 3. Exchange position panel screenshot
+
+A screenshot of an open position panel showing:
+
+```
+BTCUSDT, Шорт | Кросс 100x
+```
+
+with entry price, unrealised P&L, and other fields.
+
+<Warning>
+**Critical trap — green P&L colour ≠ long direction.**
+
+The P&L number on position panels and BYDFi cards is green when the trade is profitable and red when it is losing — **regardless of direction**. A short position that is making money shows a **green** P&L number. Reading green as "long" would produce the wrong signal.
+
+Direction is determined exclusively by the word **Лонг/Шорт** on the image or by the text of the post. The green/red zone distinction only has meaning on TradingView charts, where it indicates the take-profit and stop-loss zones relative to the entry.
+
+Both prompts explicitly state this rule:
+
+> ВАЖНО про цвета: зелёный/красный цвет цифр на карточках и панелях — это прибыль/убыток по P&L, а НЕ направление позиции. Позиция «Шорт» может показывать зелёный плюс.
+</Warning>
+
+---
+
+## Dual Pipeline Architecture
+
+Because entry and exit are structurally separate in this channel, the strategy uses two independent `Cache.file`-wrapped LLM functions and routes them through the appropriate lifecycle hooks.
+
+```
+listenIdlePing  ──→  getOpenSignal  ──→  commitCreateSignal
+listenActivePing ──→  getCloseSignal ──→  commitClosePending
+```
+
+Both caches use a 4-hour interval (test / research configuration). The production pattern from `CLAUDE.md` is a 5-minute interval with a 15-minute freshness gate, applied once prompt quality is validated.
+
+### `getOpenSignal` (cache: `vershinin_trader_open_v2`, interval: 4h)
+
+```typescript
+const getOpenSignal = Cache.file(
+  async (symbol: string, when: Date) => {
+    let messages = await scrapeLookback({
+      channel: CHANNEL_NAME,
+      limit: WINDOW_MINUTES,
+      dimension: "minute",
+      when,
+    });
+
+    // Keep posts that have text OR an image
+    messages = messages.filter(({ content, photo }) => {
+      let isOk = false;
+      if (content) isOk = true;
+      if (photo)   isOk = true;
+      return isOk;
+    });
+
+    if (!messages.length) {
+      Log.info("vershinin open", `${symbol}: окно ${WINDOW_MINUTES / 60}ч пустое, LLM не вызываю`);
+      return { signal: null };
+    }
+
+    const withPhoto = messages.filter(({ photo }) => photo).length;
+    Log.info("vershinin open", `${symbol}: отправляю модели ${messages.length} постов (с фото: ${withPhoto}), окно до ${when.toISOString()}`);
+
+    const signal = await generateObject(
+      InferenceName.OllamaInference,
+      {
+        format: PositionOpenFormat,
+        messages: [
+          { role: "user", content: await getPrompt(symbol, "prompt_open") },
+          ...messages.map(({ id, channel, date, content, photo }) => ({
+            role: "user" as const,
+            content: str.newline(
+              `ID ${id}`, "", content, "",
+              `[${date.toISOString()}]: https://t.me/c/${channel.slice(4)}/${id}`,
+            ),
+            ...(photo && { images: [photo] }),
+          })),
+        ],
+      },
+      "gemma4:31b-cloud",
+    );
+
+    // Verify the model's cited post ID exists in the window
+    const message = messages.find((message) => message.id === signal.id)!;
+    if (!message) {
+      if (signal.position !== "wait") {
+        Log.info("vershinin open", `${symbol}: пост ${signal.id} не найден в окне, сигнал отброшен`);
+      }
+      return { signal: null };
+    }
+
+    const url = `https://t.me/${message.channel}/${message.id}`;
+    return { signal, message, url };
+  },
+  {
+    interval: "4h",
+    name: "vershinin_trader_open_v2",
+  },
+);
+```
+
+### `getCloseSignal` (cache: `vershinin_trader_close_v2`, interval: 4h)
+
+The close pipeline is structurally identical — same window, same image handling — but uses `PositionCloseFormat` and a different prompt:
+
+```typescript
+const getCloseSignal = Cache.file(
+  async (symbol: string, when: Date) => {
+    // ... same scrapeLookback + filter as getOpenSignal ...
+
+    const signal = await generateObject(
+      InferenceName.OllamaInference,
+      {
+        format: PositionCloseFormat,
+        messages: [
+          { role: "user", content: await getPrompt(symbol, "prompt_close") },
+          ...messages.map(({ id, channel, date, content, photo }) => ({
+            role: "user" as const,
+            content: str.newline(
+              `ID ${id}`, "", content, "",
+              `[${date.toISOString()}]: https://t.me/c/${channel.slice(4)}/${id}`,
+            ),
+            ...(photo && { images: [photo] }),
+          })),
+        ],
+      },
+      "gemma4:31b-cloud",
+    );
+
+    // ... post ID validation, logging, return ...
+  },
+  {
+    interval: "4h",
+    name: "vershinin_trader_close_v2",
+  },
+);
+```
+
+### Lifecycle hooks
+
+```typescript
+// While no position is open — check for a new entry
+listenIdlePing(async ({ symbol, when, currentPrice }) => {
+  const { signal, message, url } = await getOpenSignal(symbol, when);
+  if (!signal) return;
+  if (signal.position !== "long" && signal.position !== "short") return;
+
+  Log.info("vershinin trade", `${symbol}: открываю ${signal.position} от цены ${currentPrice} по посту ${signal.id}, хард-стоп ${HARD_STOP_PERCENT}%`);
+
+  await commitCreateSignal(symbol, {
+    id: `${signal.id}-${signal.symbol.toLowerCase()}`,
+    symbol: signal.symbol,
+    ...Position.moonbag({
+      position: signal.position,
+      currentPrice,
+      percentStopLoss: HARD_STOP_PERCENT,
+    }),
+    note: JSON.stringify({ signal, message: omit(message, "photo"), url }, null, 2),
+  });
+});
+
+// While a position is open — watch for the author's close announcement
+listenActivePing(async ({ symbol, when }) => {
+  const { signal, message, url } = await getCloseSignal(symbol, when);
+  if (!signal) return;
+  if (signal.action !== "close") return;
+
+  Log.info("vershinin trade", `${symbol}: закрываю позицию по посту ${signal.id} от ${new Date(message.date).toISOString()}`);
+
+  await commitClosePending(symbol, {
+    note: JSON.stringify({ signal, message: omit(message, "photo"), url }, null, 2),
+  });
+});
+```
+
+---
+
+## LLM Schemas
+
+### `PositionOpenFormat`
+
+```typescript
+const PositionOpenFormat = {
+  type: "object",
+  required: ["id", "symbol", "position", "reasoning"],
+  properties: {
+    id: {
+      type: "number",
+      description: str.newline(
+        "ID сообщения из которого был сформирован сигнал.",
+        "Это число, пиши только его без строкового префикса ID, например, 2134.",
+        "Если сигнала нет, верни -1",
+      ),
+    },
+    symbol: {
+      type: "string",
+      description: str.newline(
+        "Тикер позиции строго в формате *USDT, Например",
+        "Текст #BTC/USDT преобразуем в BTCUSDT без # и /",
+      ),
+    },
+    position: {
+      type: "string",
+      enum: ["long", "short", "wait"],
+      description: "Тип позиции, long или short. Если позиции нет, верни wait",
+    },
+    reasoning: {
+      type: "string",
+      description: str.newline(
+        "Строковое описание почему ты сделал именно такое решение",
+        "Будет использовано программистом для отладки",
+      ),
+    },
+  },
+} satisfies FormatModel;
+```
+
+### `PositionCloseFormat`
+
+```typescript
+const PositionCloseFormat = {
+  type: "object",
+  required: ["id", "symbol", "action", "reasoning"],
+  properties: {
+    id: {
+      type: "number",
+      description: str.newline(
+        "ID сообщения из которого был сформировано действие.",
+        "Это число, пиши только его без строкового префикса ID, например, 2134.",
+        "Если сигнала нет, верни -1",
+      ),
+    },
+    symbol: {
+      type: "string",
+      description: str.newline(
+        "Тикер позиции строго в формате *USDT, Например",
+        "Текст #BTC/USDT преобразуем в BTCUSDT без # и /",
+      ),
+    },
+    action: {
+      type: "string",
+      enum: ["hold", "close"],
+      description: str.newline(
+        "Тип действия, hold или close. Если трейдер",
+        "закрыл позицию, в том числе все позиции разом",
+        "то выбери close. Иначе hold",
+      ),
+    },
+    reasoning: {
+      type: "string",
+      description: str.newline(
+        "Строковое описание почему ты сделал именно такое решение",
+        "Будет использовано программистом для отладки",
+      ),
+    },
+  },
+} satisfies FormatModel;
+```
+
+### Schema comparison
+
+| Field | `PositionOpenFormat` | `PositionCloseFormat` |
+|---|---|---|
+| `id` | Post ID of the entry signal | Post ID of the close announcement |
+| `symbol` | Normalised ticker (`*USDT`) | Normalised ticker (`*USDT`) |
+| `position` | `"long" \| "short" \| "wait"` | — |
+| `action` | — | `"hold" \| "close"` |
+| `reasoning` | Model's justification | Model's justification |
+
+Both schemas are intentionally minimal — no `entryRange`, no `targets`, no `stoploss`. This channel doesn't provide those fields.
+
+---
+
+## Why There Is No Pre-LLM Ticker Filter
+
+In `crypto_yoda_channel`, the strategy can pre-filter messages by a coin hashtag (`#BTC`, `#PENGU`) before calling the LLM, because the author always tags posts. In `vershinin_trader`, tickers appear as bare names:
+
+```
+BTC    ETH    1000PEPE    VIRTUAL    SOL
+```
+
+There is no `#` prefix and no `/USDT` suffix to match against. A substring search for `BTC` would false-positive on `BTCUSDT`, `1000PEPE` wouldn't match any `#`-prefixed search, and `VIRTUAL` is too generic. The entire 4-hour window therefore goes to the model unchanged.
+
+The prompt compensates with an explicit instruction:
+
+> В выборке несколько сообщений. Просмотри ВСЕ сообщения: если хотя бы в одном из них есть вход по `{{symbol}}` — верни его (id этого сообщения), даже если остальные сообщения про другие монеты, рекламу или аналитику. wait верни только когда НИ В ОДНОМ сообщении нет входа по `{{symbol}}`.
+
+<Note>
+The "scan ALL messages" rule was discovered through a regression failure: without it, the model would anchor on the last post in the batch and miss a signal from an earlier one. The fix was captured as a mandatory test case in `assets/validate.mjs`.
+</Note>
+
+---
+
+## Hard Stop: `HARD_STOP_PERCENT = 7.5`
+
+The author publishes no stop-loss levels. The strategy computes its own levels using `Position.moonbag`:
+
+```typescript
+await commitCreateSignal(symbol, {
+  id: `${signal.id}-${signal.symbol.toLowerCase()}`,
+  symbol: signal.symbol,
+  ...Position.moonbag({
+    position: signal.position,
+    currentPrice,
+    percentStopLoss: HARD_STOP_PERCENT,   // 7.5%
+  }),
+  note: JSON.stringify({ signal, message: omit(message, "photo"), url }, null, 2),
+});
+```
+
+`Position.moonbag` returns `{ position, priceTakeProfit, priceStopLoss }`:
+- **Stop-loss**: `HARD_STOP_PERCENT` (7.5%) from `currentPrice` in the adverse direction.
+- **Take-profit**: fixed at +50% from `currentPrice` — effectively "until the author says close".
+
+The position is meant to be held until `getCloseSignal` fires `commitClosePending`, not until it hits the TP. The TP acts as a safety ceiling in case the close pipeline misses something.
+
+---
+
+## Vision in Messages
+
+Images are attached to message objects using the `images` field in the `json-inference` message array. The `photo` field on a `ScraperMessage` is a base64-encoded JPEG preview (800px):
+
+```typescript
+...messages.map(({ id, channel, date, content, photo }) => ({
+  role: "user" as const,
+  content: str.newline(
+    `ID ${id}`,
+    "",
+    content,
+    "",
+    `[${date.toISOString()}]: https://t.me/c/${channel.slice(4)}/${id}`,
+  ),
+  ...(photo && { images: [photo] }),   // only added when the post has an image
+})),
+```
+
+Photos are omitted from the signal `note` to keep storage size manageable:
+
+```typescript
+note: JSON.stringify({ signal, message: omit(message, "photo"), url }, null, 2),
+```
+
+<Warning>
+Adding images changes the model's input. The cache bucket names carry a version suffix (`_v2`) specifically because the addition of images was a breaking change — switching from `_v1` to `_v2` prevented stale text-only cached responses from mixing with the new vision responses.
+</Warning>
+
+---
+
+## Logging
+
+Three `Log.info` topics are used, each covering a different layer of the pipeline:
+
+| Topic | When it fires | What it logs |
+|---|---|---|
+| `"vershinin open"` | Every real LLM call in `getOpenSignal` | Window empty → skip; N posts sent (M with photos); model's verdict with reasoning; hallucinated post ID discarded |
+| `"vershinin close"` | Every real LLM call in `getCloseSignal` | Same structure for the close pipeline |
+| `"vershinin trade"` | Actual position state changes | "Opening long from price X on post Y, hard-stop 7.5%"; "Closing position on post Z from [timestamp]" |
+
+Log calls fire only during real LLM invocations — i.e. once every 4 hours per symbol, not on every minute tick. Cache hits produce no log output.
+
+Logs are written to `dump/log/log.jsonl` when `Log.useJsonl()` is active (configured in `config/setup.config.ts`).
+
+---
+
+## `listenError` Handler
+
+Unhandled errors from all listeners are caught and logged:
+
+```typescript
+listenError((error) => {
+  console.log(error);
+  Log.debug("error", {
+    error: errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+```
+
+`errorData` and `getErrorMessage` are from `functools-kit`. The handler ensures that transient errors (Telegram flood-wait, network blips, LLM timeouts) appear in the log rather than silently crashing a symbol's background context.
+
+---
+
+## Prompt Regression: `validate.mjs`
+
+After any change to `prompt_open.mustache` or `prompt_close.mustache`, run the regression suite:
+
+```bash
+cd content/vershinin_trader
+node assets/validate.mjs
+```
+
+The script runs 10 mandatory cases through the exact strategy pipeline (same schema, same prompt, same `messages` assembly including images) against the live model, and prints `PASS`/`FAIL` per case:
+
+```javascript
+// open: full text entry for ETH among ads and an unrelated coin
+await run("open", "ETHUSDT", [3576, 3548, 3550], { verdict: "long", id: 3548 });
+// open: no BTC signal in this batch → wait
+await run("open", "BTCUSDT", [3576, 3548, 3550], { verdict: "wait" });
+// open: SOL long from current levels
+await run("open", "SOLUSDT", [3576, 3548, 3550], { verdict: "long", id: 3550 });
+// open (vision): direction only from TradingView chart
+await run("open", "ETHUSDT", [3572], { verdict: "long", id: 3572 });
+await run("open", "BTCUSDT", [3573], { verdict: "long", id: 3573 });
+// open (vision): BYDFi card shows VIRTUAL long — querying BTC → wait
+await run("open", "BTCUSDT", [3558], { verdict: "wait" });
+// close: stop move → hold
+await run("close", "ETHUSDT", [3557], { verdict: "hold" });
+// close: partial take → hold
+await run("close", "ETHUSDT", [3569], { verdict: "hold" });
+// close: "мои шорты принимаю решение закрыть" → close
+await run("close", "BTCUSDT", [3564], { verdict: "close", id: 3564 });
+// close: analytics only → hold
+await run("close", "BTCUSDT", [3537], { verdict: "hold" });
+```
+
+Exit code 1 on any failure. Cases are keyed to real post IDs; if those IDs scroll out of the channel's accessible range, update them via `assets/read-posts.mjs`.
+
+<Note>
+The "scan ALL messages" prompt rule was discovered as a regression: without it, the model would anchor on the last post in a multi-post batch and return the wrong `id`. The fix is validated by the `ETHUSDT` multi-post test cases above.
+</Note>
+
+---
+
+## Constants
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `WINDOW_MINUTES` | `240` (4h) | Scrape window for both pipelines |
+| `HARD_STOP_PERCENT` | `7.5` | Hard stop distance from entry price (author publishes no stops) |
+| `Cache.file` interval | `"4h"` | LLM check frequency per symbol (test/research configuration) |
+| `CHANNEL_NAME` | `"-1002833393903"` | Private channel numeric ID |
+
+<Note>
+`WINDOW_MINUTES` is labelled "test; production will be 15 minutes" in the source. When the prompt is validated and the strategy moves to production, set the `Cache.file` interval to `"5m"` and the scrape window to 15 minutes, matching the `crypto_yoda_channel` production configuration.
+</Note>
+
+---
+
+## Run Commands
+
+Authorize Telegram (one-time, interactive):
+
+```bash
+# session.txt is shared — copy from crypto_yoda_channel if it already exists
+cp content/crypto_yoda_channel/session.txt content/vershinin_trader/session.txt
+
+# Or authorize fresh from this folder
+cd content/vershinin_trader
+node -e 'require("telegram-reader").signIn()'
+```
+
+Run the backtest:
+
+```bash
+# Standard backtest
+npm start -- --backtest --ui --entry ./content/vershinin_trader/main.strategy.ts
+
+# With candle pre-warming (faster replay)
+npm start -- --backtest --ui --entry ./content/vershinin_trader/main.strategy.ts --cache
+```
+
+Run prompt regression after any prompt change:
+
+```bash
+cd content/vershinin_trader
+node assets/validate.mjs
+```
+
+<Warning>
+Changing either LLM schema or prompt requires renaming both cache buckets. Current names are `vershinin_trader_open_v2` and `vershinin_trader_close_v2`. The `_v2` suffix marks the introduction of image support. Reusing old bucket names after a change will mix cached text-only responses with new vision responses.
+</Warning>

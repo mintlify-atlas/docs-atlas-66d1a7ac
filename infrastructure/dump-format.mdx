@@ -1,0 +1,246 @@
+---
+title: "Backtest Dump Format: Reading Trade Reports and Logs"
+sidebarTitle: "Dump Format"
+description: "Reference for all JSONL files written to content/<channel>/dump/ after each backtest run: backtest.jsonl trade lifecycle events, strategy.jsonl commits, and log/log.jsonl telemetry."
+---
+
+## Dump Location
+
+Every backtest run recreates the directory:
+
+```
+content/<channel>/dump/
+  report/
+    backtest.jsonl        # main: position lifecycle events
+    strategy.jsonl        # commit actions (breakeven, partial, etc.)
+    breakeven.jsonl       # one row per SL move to entry
+    highest_profit.jsonl  # peak profit per position
+    max_drawdown.jsonl    # max drawdown per position
+    partial.jsonl         # partial close events
+    heat.jsonl            # per-symbol heat map
+    performance.jsonl     # performance measurements (large — profiling only)
+  log/
+    log.jsonl             # Log.* calls when Log.useJsonl() is active
+```
+
+The directory is wiped at the start of each run. Archive results you want to keep before re-running.
+
+## JSONL Envelope
+
+Every line in every report file is a self-contained JSON object:
+
+```json
+{
+  "reportName":   "backtest",
+  "symbol":       "BTCUSDT",
+  "strategyName": "crypto_yoda",
+  "exchangeName": "ccxt-exchange",
+  "frameName":    "aug_2026_frame",
+  "timestamp":    1753920300000,
+  "data":         { ... }
+}
+```
+
+All analysis lives inside `data`. The outer fields are useful for filtering when you concatenate reports across symbols.
+
+## `backtest.jsonl` — Position Lifecycle
+
+This is the primary file for trade analysis. Filter by `data.action`.
+
+### `idle` — tick without a position
+
+```json
+{ "data": { "action": "idle", "currentPrice": 65420.10 } }
+```
+
+`idle` events account for roughly 98 % of the file by line count (a 237 MB file becomes ~23 MB after removing them). Skip them for trade analysis:
+
+```js
+import { createReadStream } from "fs";
+import { createInterface } from "readline";
+
+const rl = createInterface({ input: createReadStream("dump/report/backtest.jsonl") });
+
+for await (const line of rl) {
+  const obj = JSON.parse(line);
+  if (obj.data?.action === "idle") continue;   // skip — 98% of volume
+  // process opened / active / closed events
+}
+```
+
+### `opened` — entry event
+
+Fired once when a position is created:
+
+```json
+{
+  "data": {
+    "action":               "opened",
+    "signalId":             "1234-btcusdt",
+    "position":             "long",
+    "priceOpen":            65420.10,
+    "priceTakeProfit":      70000.00,
+    "priceStopLoss":        63000.00,
+    "originalPriceOpen":    65420.10,
+    "originalPriceTakeProfit": 70000.00,
+    "originalPriceStopLoss":   63000.00,
+    "payload":              { "levels": [67000, 68500, 70000, 71200, 72000] },
+    "note":                 "{\"entry\": {...}, \"message\": {...}}"
+  }
+}
+```
+
+`original*` copies are set once at open and never modified; the live `price*` fields reflect subsequent ratchet moves. Comparing them at `closed` time reveals whether management was applied.
+
+### `active` — per-minute position snapshot
+
+Fired every minute while a position is open:
+
+```json
+{
+  "data": {
+    "action":              "active",
+    "signalId":            "1234-btcusdt",
+    "pnl":                 142.30,
+    "percentTp":           0.42,
+    "percentSl":           0.18,
+    "peakProfitAbsolute":  198.00,
+    "peakProfitPercentage": 0.58,
+    "maxDrawdownAbsolute": -55.20,
+    "maxDrawdownPercentage": -0.16
+  }
+}
+```
+
+Stream `active` events by `signalId` to reconstruct a position's full trajectory — useful for finding the exact tick when a level was reached or when a SL move happened.
+
+### `closed` — final event
+
+```json
+{
+  "data": {
+    "action":               "closed",
+    "signalId":             "1234-btcusdt",
+    "closeReason":          "stop_loss",
+    "duration":             7320000,
+    "pnl":                  -38.50,
+    "peakProfitPercentage": 0.58,
+    "maxDrawdownPercentage": -0.16,
+    "priceStopLoss":        65420.10,
+    "originalPriceStopLoss": 63000.00
+  }
+}
+```
+
+### Close Reason Attribution
+
+Three distinct close outcomes are distinguishable without extra fields:
+
+| Condition | Meaning |
+|---|---|
+| `closeReason === "closed"` | `commitClosePending` from the ratchet or LLM-driven close logic |
+| `closeReason === "stop_loss"` **and** `priceStopLoss !== originalPriceStopLoss` | Stop was moved to breakeven and then hit |
+| `closeReason === "stop_loss"` **and** `priceStopLoss === originalPriceStopLoss` | Honest channel stop — original stop level hit without any ratchet move |
+
+### Filtering for Closed Trades Only
+
+```js
+const rl = createInterface({ input: createReadStream("dump/report/backtest.jsonl") });
+const trades = [];
+
+for await (const line of rl) {
+  const obj = JSON.parse(line);
+  if (obj.data?.action !== "closed") continue;
+  trades.push(obj);
+}
+
+console.log(`Total closed trades: ${trades.length}`);
+console.log(
+  `Win rate: ${(trades.filter(t => t.data.pnl > 0).length / trades.length * 100).toFixed(1)}%`
+);
+```
+
+## Other Report Files
+
+| File | One row per | Key fields |
+|---|---|---|
+| `strategy.jsonl` | Each commit action | `action` (breakeven, partial…), full position snapshot with updated `priceTakeProfit` / `priceStopLoss` |
+| `breakeven.jsonl` | Each SL move to entry | `signalId`, `symbol`, tick timestamp |
+| `highest_profit.jsonl` | Position | `signalId`, `peakProfitPercentage`, `peakProfitAbsolute` |
+| `max_drawdown.jsonl` | Position | `signalId`, `maxDrawdownPercentage`, `maxDrawdownAbsolute` |
+| `partial.jsonl` | Partial close event | `signalId`, closed quantity, remaining quantity |
+| `heat.jsonl` | Symbol aggregate | win/loss counts, total pnl, trade count per symbol |
+| `performance.jsonl` | Timing measurement | Profiling data; large file — not needed for trade analysis |
+
+## `log/log.jsonl` — Telemetry
+
+Written when `Log.useJsonl()` is active (enabled in `config/setup.config.ts`). Each line:
+
+```json
+{
+  "type":             "debug",
+  "timestamp":        1753920300000,
+  "createdAt":        "2024-01-15T10:23:41.000Z",
+  "methodContext":    { "strategyName": "crypto_yoda", "exchangeName": "ccxt-exchange", "frameName": "aug_2026_frame" },
+  "executionContext": { "when": "2026-08-14T09:45:00.000Z", "symbol": "BTCUSDT", "backtest": true },
+  "topic":            "crypto_yoda trailing drift",
+  "args":             [{ "signalId": "1234-btcusdt", "driftRatio": 0.14, "driftRatioLimit": 0.3, "step": 820.0 }]
+}
+```
+
+Key points:
+
+- **`timestamp`** is backtest time (the tick's `when`); **`createdAt`** is wall-clock time.
+- **Context is auto-injected** via `async_hooks` — `methodContext` and `executionContext` are populated automatically inside strategy callbacks. No manual propagation needed.
+- **Work with `topic` + `args[0]`**. The payload is always in `args[0]` as a flat object.
+- `Log.info` — rare transition events: level taken, ratchet closed, stop moved to breakeven.
+- `Log.debug` — dense measurement streams for threshold calibration: drift on every active ping (when `drift > 0`), stagnation with throttling (`minutesActive % 15 === 0`).
+- `Log.warn` — anomalies and unexpected conditions.
+
+### Log Analysis Pattern
+
+```js
+import { createReadStream } from "fs";
+import { createInterface } from "readline";
+
+const rl = createInterface({ input: createReadStream("dump/log/log.jsonl") });
+
+const byTopic = {};
+
+for await (const line of rl) {
+  const obj = JSON.parse(line);
+  const { topic, args } = obj;
+  (byTopic[topic] ??= []).push(args[0]);
+}
+
+// group drift events by signalId, compute percentile of survived driftRatio
+const driftEvents = byTopic["crypto_yoda trailing drift"] ?? [];
+const bySignal = {};
+for (const e of driftEvents) {
+  (bySignal[e.signalId] ??= []).push(e.driftRatio);
+}
+
+// compare distributions: signals that later had level_up vs signals that closed at stop
+// → ceiling of "noise" retraces determines the LEVEL_DRIFT_RATIO threshold
+```
+
+This is how the `LEVEL_DRIFT_RATIO = 0.3` threshold was derived: percentiles of `driftRatio` values in positions that subsequently hit the next level (n = 62 survived retraces) showed a noise ceiling of 0.186. Any threshold in the range 0.2–0.3 left those positions untouched. `0.3` was chosen as a conservative margin.
+
+## `config/setup.config.ts` — Enabling the Dump
+
+The relevant lines from `config/setup.config.ts`:
+
+```ts
+import { Dump, Markdown, Log } from "backtest-kit";
+
+{
+  Dump.useMarkdown();   // enables report writing to dump/
+}
+
+{
+  Markdown.useDummy();  // suppresses markdown UI output (not needed in backtest)
+  Log.useJsonl();       // routes Log.* calls to dump/log/log.jsonl
+}
+```
+
+`Log.useJsonl()` must be called before any strategy code runs. Without it, `Log.info`/`Log.debug` calls go to the in-memory backend (`useMemory` is the default) and `log.jsonl` is never written.

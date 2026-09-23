@@ -1,0 +1,146 @@
+---
+title: "Event Study: Finding the Real Edge Horizon"
+sidebarTitle: "Event Study"
+description: "How to measure directional price moves at +15m, +1h, +4h, +12h, +24h after each signal post, interpret pre-post drift, and distinguish genuine edge from trend-echo."
+---
+
+## What an Event Study Answers
+
+A signal channel author's reported results are always curated: wins get posted, losses go quiet. An event study bypasses the curation entirely by asking a structural question:
+
+> At what time horizon does price move in the signaled direction, and how often?
+
+There is a second equally important question:
+
+> Was the price already moving that way before the post? (Pre-drift — is the author just posting on momentum, or does information appear at publication?)
+
+Both questions are answered from two MongoDB collections written by the engine — no look-ahead, no self-reporting.
+
+## The Two Collections
+
+### `measure-items` — LLM Cache with Signals
+
+Every `Cache.file` call writes its result to `measure-items`. For the event study, the relevant documents are the ones where the model returned a directional signal:
+
+```
+{ bucket: "crypto_yoda_entry_v3_5m_0",
+  entryKey: "BTCUSDT_1722470400000",
+  payload: { data: { entry: { position: "long", id: 2341, ... } } } }
+```
+
+The `entryKey` encodes both `symbol` and the tick timestamp in milliseconds. The direction (`long`/`short`) and the source post ID come from `payload.data.entry`.
+
+### `candle-items` — 1m OHLCV from `--cache`
+
+Populated by running the backtest with the `--cache` flag. Each document is a 1-minute candle:
+
+```
+{ symbol: "BTCUSDT", interval: "1m",
+  timestamp: 1722470400000,   // candle open time
+  open, high, low, close, volume }
+```
+
+The event study script looks up `close` prices at the signal tick and at each horizon by querying this collection directly — no exchange calls, no look-ahead.
+
+## The Measurement Pattern
+
+For each signal: get price `p0` at the tick, get price `p1` at each horizon, compute the directional move:
+
+```
+directional_move = ((p1 - p0) / p0) × 100 × (direction == "long" ? 1 : -1)
+```
+
+A positive result means price moved in the signaled direction. Negative means it moved against.
+
+Pre-drift uses the same formula with negative offsets: price at `t - 15m`, `t - 1h`, etc. A ~50% hit rate on pre-drift means the author is **not** just posting on an existing trend — the information appears at publication, not before.
+
+## Running the Event Study
+
+```bash
+node assets/event-study.mjs <bucket-name>
+```
+
+Get available bucket names first:
+
+```bash
+node assets/read-cache.mjs
+```
+
+Example: `node assets/event-study.mjs crypto_yoda_entry_v3_5m_0`
+
+The script (from `content/crypto_yoda_channel/assets/event-study.mjs`) connects to MongoDB, pulls all directional signals from the bucket, looks up prices at each horizon from `candle-items`, and prints a per-signal table followed by an aggregate summary.
+
+## Output Format
+
+The script prints two sections.
+
+**Per-signal rows** — one line per signal, tab-separated, with forward horizons then pre-drift:
+
+```
+сигнал          направл.  +15м   +1ч    +4ч    +12ч   +24ч  | -15м  -1ч    -4ч    -12ч   -24ч
+BTCUSDT#2341    long      -0.12  -0.31  +0.88  +1.21  +2.14 | +0.33  +0.45  +0.91  +1.12  +1.38
+PENGUUSDT#2389  long       0.44  +0.82  +1.44  +2.01  +3.22 | -0.11  +0.12  -0.33  +0.44  +0.55
+...
+```
+
+A dash (`-`) indicates a missing candle at that horizon — run with `--cache` to fill gaps.
+
+**Aggregate summary** — mean, median, and hit rate per horizon:
+
+```
+=== сводка (направленный ход, % без плеча) ===
++15м после:   средн=-0.041%   медиана=-0.055%   hit=7/18
++60м после:   средн=-0.089%   медиана=-0.021%   hit=8/18
++240м после:  средн=+0.312%   медиана=+0.188%   hit=10/18
++720м после:  средн=+0.841%   медиана=+0.634%   hit=11/18
++1440м после: средн=+1.420%   медиана=+1.180%   hit=13/18
+15м ДО поста: средн=+0.221%   медиана=+0.101%   hit=9/18
+60м ДО поста: средн=+0.389%   медиана=+0.244%   hit=9/18
+...
+Чтение: эдж есть там, где после поста hit-rate и среднее растут с горизонтом.
+Пре-дрифт ~50% hit = автор не просто постит по тренду; высокий пре-дрифт = моментум-эхо.
+```
+
+## Actual Findings: crypto_yoda_channel
+
+The one-month backtest over August 2026 produced 18 directional signals across all symbols. Results:
+
+| Horizon | Hit rate | Mean move |
+|---|---|---|
+| +15m | 7/18 (39%) | −0.04% |
+| +1h | 8/18 (44%) | −0.09% |
+| +4h | 10/18 (56%) | +0.31% |
+| +12h | 11/18 (61%) | +0.84% |
+| **+24h** | **13/18 (72%)** | **+1.42%** |
+
+Pre-drift at all horizons: 7–9/18, approximately coin-flip. The author is **not** just posting on trend — the information appears at publication time.
+
+Interpretation:
+- The **edge is real** — 72% directional hit rate at 24h unleveraged is above noise
+- The **edge is not at the entry** — first 15–60 minutes are slightly negative
+- The **edge horizon is 12–24h** — a structural finding that shapes every exit decision
+- **Pre-drift ≈ 50%** — this is genuine signal, not momentum echo
+
+The seller's advertised plan (five scale-out targets at X13–25 leverage) captures none of this edge: TP4 and TP5 hit rate was 0/16. The marketing shows the 44% that reached TP1; subscribers eat the remaining 56%.
+
+## Interpreting Results
+
+**Rising hit rate and mean with horizon** = edge is real and grows over time. Entry timing matters less than direction.
+
+**High pre-drift** = the author is posting on existing momentum. The market already knew. There is no new information at publication.
+
+**~50% pre-drift, rising post-drift** = information appears at publication. The author knows something the market doesn't yet (or is large enough to move price).
+
+**Flat at all horizons** = no edge. The channel is noise.
+
+## Thresholds and Constants Doctrine
+
+Any threshold derived from one month of data (16–18 events) is a hypothesis, not a fact. The project applies one rule:
+
+1. **Structural rules beat magic numbers.** A rule anchored in the geometry of the signal (e.g. "move stop after 50% of distance to TP1") has no free parameters to overfit. A number like "close after 360 minutes of stagnation" has no distribution to validate it against.
+2. **Numbers must come from process distributions, not trade outcomes.** The ratchet slack `0.3` was chosen because the empirical distribution of survived retraces had a noise ceiling of `0.186` (n=62) — any threshold 0.2–0.3 would not have touched live positions. That is a distribution-derived constant. A constant "tuned to show good PnL this month" is not.
+3. **Candidates must survive walk-forward.** Before trusting any constant, extend the backtest frame to 4–6 months and run `Sweep` (parameter grid) plus `Walker` (optimize on window N, validate on N+1) from backtest-kit.
+
+<Note>
+  The one-month sample (16–18 events per claim) is hypothesis-grade, not proof. The repo is explicit about this. The point is the **method**: every number above is reproducible from `measure-items` + `candle-items` using the scripts in `content/crypto_yoda_channel/assets/`. Run the same scripts on a longer frame before acting on any of these findings.
+</Note>

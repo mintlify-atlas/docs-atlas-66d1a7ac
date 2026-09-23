@@ -1,0 +1,327 @@
+---
+title: "Forensics Scripts: Analyzing Signals, Cache, and Candle Data"
+sidebarTitle: "Forensics Scripts"
+description: "Reference for all assets/ diagnostic scripts: event-study.mjs, read-cache.mjs, read-posts.mjs, validate.mjs, and download-photos.mjs with usage examples."
+---
+
+Each channel folder contains an `assets/` directory with diagnostic scripts. Every script is designed to answer **one specific question** — not to dump raw data. Run them from the channel folder (`content/<channel>/`) unless stated otherwise.
+
+---
+
+## Standard MongoDB Connection
+
+All scripts that read from MongoDB use the same connection pattern:
+
+```javascript
+import mongoose from "mongoose";
+
+const conn = await mongoose.createConnection("mongodb://localhost:27017/backtest-kit").asPromise();
+const db = conn.getClient().db("backtest-kit");
+```
+
+The relevant collections:
+
+| Collection | Contents |
+|---|---|
+| `measure-items` | LLM cache entries written by `Cache.file`. Keyed by `bucket` + `entryKey`. |
+| `candle-items` | 1-minute OHLCV candles populated by `npm start -- --backtest --cache`. |
+
+---
+
+## `event-study.mjs` (crypto_yoda_channel only)
+
+**Question:** At what horizon does price actually move in the signaled direction?
+
+**Usage:**
+
+```bash
+# from project root or content/crypto_yoda_channel/
+node assets/event-study.mjs <bucket>
+
+# example
+node assets/event-study.mjs crypto_yoda_entry_v3_5m_0
+```
+
+**Requires:**
+- `measure-items` populated by a backtest run (signals with `position: "long" | "short"`)
+- `candle-items` populated by `--cache` warm-up (1-minute candles for the symbols)
+
+To find available buckets, run `node assets/read-cache.mjs` first.
+
+**How it works:**
+
+For each long/short signal in the bucket, the script reads the candle price at the tick timestamp and at five forward horizons (15m, 1h, 4h, 12h, 24h). The directional move is calculated as:
+
+```
+move = ((p1 - p0) / p0) * 100 * (direction === "long" ? 1 : -1)
+```
+
+The same horizons are computed backwards (pre-drift) — this separates genuine signal edge from trend-following behaviour.
+
+**Output format:**
+
+```
+Signals in crypto_yoda_entry_v3_5m_0: 47
+
+symbol#postId   direction   15m     1h      4h      12h     24h     | pre-drift: -15m  -1h     -4h     -12h    -24h
+BTCUSDT#5890    long        0.12    0.45    1.23    2.10    3.44    | -0.08    0.22    0.81    1.20    1.98
+PENGUUSDT#5885  short       0.31   -0.12    0.67    1.55    2.89    | ...
+
+=== summary (directional move, % no leverage) ===
++15m after:    mean=0.234%   median=0.190%   hit=28/47
++60m after:    mean=0.411%   median=0.330%   hit=31/47
++240m after:   mean=0.872%   median=0.610%   hit=34/47
++720m after:   mean=1.340%   median=1.010%   hit=36/47
++1440m after:  mean=1.891%   median=1.420%   hit=38/47
+15m ДО поста:  mean=0.122%   median=0.081%   hit=25/47
+...
+```
+
+**Reading the output:**
+- Edge exists where hit-rate and mean grow with horizon
+- Pre-drift near 50% hit → author is not simply posting along an existing trend; the information appears at publication
+- High pre-drift → momentum echo effect (price was already moving before the post)
+
+If a candle is missing for a specific tick, the script prints `no candle at tick (re-run --cache)` and skips that signal.
+
+---
+
+## `read-cache.mjs`
+
+**Question:** What did the model return across the whole month?
+
+**Usage:**
+
+```bash
+# list all buckets and their record counts
+node assets/read-cache.mjs
+
+# inspect all non-null verdicts in a specific bucket
+node assets/read-cache.mjs crypto_yoda_entry_v3_5m_0
+```
+
+**Output — no bucket argument (bucket listing):**
+
+```
+Buckets in measure-items:
+  crypto_yoda_entry_v2_4h_0: 312 records
+  crypto_yoda_entry_v3_5m_0: 4128 records
+```
+
+**Output — with bucket argument:**
+
+```
+Bucket crypto_yoda_entry_v3_5m_0: 4128 records, 47 non-null model responses
+
+BTCUSDT   2026-08-14T09:30  long    post=5890  78600-79400  sl=77400  targets=[80200,81000,82500,84000,86000]
+  Нашёл явный сигнал в посте 5890: BTC/USDT лонг с зоной 78600-79400...
+
+PENGUUSDT 2026-08-14T11:15  short   post=5885  0.01350-0.01380  sl=0.01420  targets=[...]
+  ...
+```
+
+Each non-null entry shows: symbol, tick time, position direction, source post ID, entry range, stop-loss, targets array, and the model's reasoning text.
+
+Use this to verify:
+- Correct positions and numeric values (prices are copied from posts, not hallucinated)
+- Normalized symbol format (`BTCUSDT`, not `BTC/USDT` or `#BTC`)
+- `reasoning` is coherent (detects prompt regression before re-running the full backtest)
+
+---
+
+## `read-posts.mjs`
+
+**Question:** What does the channel author actually post?
+
+**Usage:**
+
+```bash
+# run from the channel folder (session.txt must be present)
+cd content/crypto_yoda_channel
+
+node assets/read-posts.mjs               # last 40 posts
+node assets/read-posts.mjs 100           # last 100 posts
+node assets/read-posts.mjs 40 40         # page 2 (offset 40)
+node assets/read-posts.mjs 5890 5776     # specific posts by ID (numbers > 1000 treated as IDs)
+
+# filter gramjs noise
+node assets/read-posts.mjs | grep -v "resize begin"
+```
+
+**Output:**
+
+```
+=== id=5890 date=2026-08-14T09:28:00.000Z photo=no len=412
+#BTC/USDT
+Лонг позиция
+Зона входа: $78600 - $79400
+Цели: $80200 / $81000 / $82500 / $84000 / $86000
+Стоп: $77400
+
+=== id=5776 date=2026-08-10T14:05:00.000Z photo=no len=89
+#BTC/USDT
+Тейк-профит 1 ✅
+Отличная сделка!
+```
+
+Use this script at the start of a new channel integration to understand:
+- Post formats: does the author post entry ranges or single prices? How many targets? Are stops included?
+- Non-signal post types: result announcements, advertisements, analytics without a ticker
+- Channel tag format: `#BTC`, `#BTC/USDT`, `$BTC`, no tag at all (affects pre-LLM filtering)
+- Whether photos carry signal information (requires `download-photos.mjs`)
+
+The vershinin_trader version supports the same usage patterns on the private channel (`"-1002833393903"`).
+
+---
+
+## `validate.mjs`
+
+**Question:** Does the prompt still correctly parse every mandatory case after an edit?
+
+**Usage:**
+
+```bash
+# run from the channel folder
+cd content/crypto_yoda_channel
+node assets/validate.mjs
+
+# exit code 0 = ALL PASS
+# exit code 1 = one or more FAIL
+```
+
+**Output:**
+
+```
+PASS BTCUSDT posts=[5890] -> long id=5890
+PASS BTCUSDT posts=[5776] -> wait
+PASS BTCUSDT posts=[5885] -> wait
+PASS PENGUUSDT posts=[5885] -> short id=5885
+
+ALL PASS
+```
+
+On failure:
+
+```
+FAIL BTCUSDT posts=[5890] -> wait id=-1 (провалено: position, id)
+  received: {"id":-1,"symbol":"BTCUSDT","position":"wait",...}
+
+1 FAIL
+```
+
+**What it tests:**
+
+The script runs the **exact production pipeline** — same schema, same prompt loaded from `prompt.mustache`, same message assembly format (`ID {id}\n\ncontent\n\n[date]: url`) — against real post IDs from the channel.
+
+Cases in `crypto_yoda_channel/assets/validate.mjs`:
+
+| Case | Posts | Symbol | Expected |
+|---|---|---|---|
+| Signal post: range + 5 targets + stop | `[5890]` | `BTCUSDT` | `long`, `id=5890`, `entryFrom=78600`, `stoploss=77400`, 5 numeric targets |
+| Result report ("take profit ✅") | `[5776]` | `BTCUSDT` | `wait` |
+| Signal for different coin | `[5885]` | `BTCUSDT` | `wait` |
+| Same post, correct symbol | `[5885]` | `PENGUUSDT` | `short`, `id=5885`, numeric targets |
+
+Cases in `vershinin_trader/assets/validate.mjs` cover both open and close pipelines, including vision (posts with images):
+
+| Case | Kind | Expected |
+|---|---|---|
+| ETH long signal among ads and unrelated posts | open | `long id=3548` |
+| No BTC signal in window | open | `wait` |
+| SOL long from current levels | open | `long id=3550` |
+| TradingView chart image, direction from zones | open (vision) | `long id=3572` |
+| BYDFi card for different symbol | open (vision) | `wait` |
+| Stop move post | close | `hold` |
+| Partial close post | close | `hold` |
+| "I'm closing my shorts" post | close | `close id=3564` |
+
+<Warning>
+  **Run `validate.mjs` after every prompt or schema change.** Cases are anchored to real post IDs. If the channel has progressed far enough that old IDs fall outside the scrape window, update the IDs to fresh examples using `read-posts.mjs`.
+</Warning>
+
+---
+
+## `download-photos.mjs` (vershinin_trader only)
+
+**Question:** What is actually in the channel's images?
+
+**Usage:**
+
+```bash
+# run from content/vershinin_trader/ (session.txt must be present)
+cd content/vershinin_trader
+
+node assets/download-photos.mjs                    # all photos from last 40 posts
+node assets/download-photos.mjs 3573 3572 3558     # specific post IDs
+```
+
+**Output:**
+
+```
+3573 saved photo_3573.tmp.jpg (text: BTC в лонг с текущих, цель...)
+3572 saved photo_3572.tmp.jpg (без текста)
+3558 no photo (or post not found in last 40)
+```
+
+Files are saved as `photo_<id>.tmp.jpg` in the current directory. Inspect them with any image viewer, then delete.
+
+<Warning>
+  **Never write vision prompt rules without looking at real images first.** Every channel has different image types:
+  - TradingView position tool: take-profit and stop-loss zones as colored regions
+  - BYDFi share cards: direction stated as a word (Long/Short) on a card
+  - P&L screenshots: green color = profit, NOT long direction (a short position in profit is green)
+
+  Describing image content without visual verification leads to wrong prompt rules that fail silently.
+</Warning>
+
+---
+
+## Debugging Doctrine
+
+### Inline queries
+
+For quick MongoDB lookups, use `node -e` with a one-liner:
+
+```bash
+node -e "
+const mongoose = require('mongoose');
+mongoose.createConnection('mongodb://localhost:27017/backtest-kit').asPromise()
+  .then(conn => conn.getClient().db('backtest-kit').collection('measure-items')
+    .aggregate([{ \$group: { _id: '\$bucket', count: { \$sum: 1 } } }]).toArray())
+  .then(r => { console.log(r); process.exit(0); })
+"
+```
+
+### Temp files for complex scripts
+
+When the script contains Russian text with apostrophes or complex multi-line logic, `node -e '...'` fails because the shell cannot handle single quotes inside single-quoted strings. Use a temp file instead:
+
+```bash
+# write the script
+cat > debug.tmp.mjs << 'EOF'
+import mongoose from "mongoose";
+const conn = await mongoose.createConnection("mongodb://localhost:27017/backtest-kit").asPromise();
+// ... query logic ...
+process.exit(0);
+EOF
+
+# run it
+node debug.tmp.mjs
+
+# delete immediately after
+rm debug.tmp.mjs
+```
+
+Name temp files `*.tmp.mjs` — this suffix is gitignored and makes them easy to find and clean up.
+
+### One question per script output
+
+Each forensics script output must answer exactly one question:
+
+| Good | Bad |
+|---|---|
+| `PASS/FAIL` with field-level diff | Raw JSON dump of all records |
+| `hit=28/47` at each horizon | All candle prices for all signals |
+| `mean=0.411%  median=0.330%` | Unprocessed signal list |
+
+Build scripts to report actionable conclusions, not raw data. The scripts in this project follow this rule: `read-cache.mjs` answers "is parsing correct?", `event-study.mjs` answers "where is the edge?", `validate.mjs` answers "did my prompt change break anything?".

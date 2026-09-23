@@ -1,0 +1,96 @@
+---
+title: "backtest-ollama-casual: Measure Telegram Signal Channels"
+sidebarTitle: "Introduction"
+description: "backtest-ollama-casual replays Telegram signal channels against minute candles with no look-ahead bias, using an Ollama LLM to parse text and chart screenshots into executable trades."
+---
+
+## What Is backtest-ollama-casual?
+
+**backtest-ollama-casual** is a measurement rig for the paid-signals industry, built on [backtest-kit](https://github.com/tripolskypetr/backtest-kit). It is **not a trading bot**. It does not manage live positions autonomously, does not promise profitable signals, and is not a production system ready to deploy with your exchange API keys.
+
+What it does: an LLM (`gemma4:31b-cloud` via [json-inference](https://github.com/tripolskypetr/json-inference)) parses each Telegram signal-seller's own guidance — text **and chart screenshots** — the engine executes trades within minutes of publication, and event studies over minute candles answer the question nobody in that industry wants asked: **where does the edge actually live, and does it survive the seller's own money management?**
+
+## Why This Exists
+
+Signal channels are a murky industry everyone "knows" about and almost nobody has measured. Their reports show leveraged wins on partial take-profits. Their losses go unposted. Their methodology is unfalsifiable — until you replay a month of their posts against minute candles with no look-ahead bias. This repo does exactly that for two channels with completely different formats.
+
+The problem with the paid-signals industry is structural:
+
+- **Reports show the winners.** A seller posts every time TP1 hits (+2% on leverage = big number). They go quiet on the stops.
+- **Losses are unposted.** There is no public ledger. You see the highlights reel.
+- **Methodology is unfalsifiable.** Without a timestamp-exact replay against a neutral price source, you cannot know what the real EV is.
+
+Replaying posts against minute candles with no look-ahead bias changes that. You take the seller's own words — their entry zone, their targets, their stop — run them through a structured LLM pipeline, execute within minutes of the post timestamp, and measure what actually happens.
+
+## Key Findings
+
+The answers turned out to be more interesting than "scam / not scam":
+
+**The direction has a real micro-edge — but not where the seller says.** 24 hours after a post, price moved the signalled way in 13/18 cases (72%), mean +1.42% unleveraged. In the first 15–60 minutes: nothing (slightly negative). The edge lives at the 12–24h horizon; pre-post drift is a coin flip (7–9/18), so it is not mere trend-echo.
+
+**The seller's own plan is mathematically ruinous.** Across 16 entries, price reached TP1 in 44%, TP2 in 19%, TP3 in 6%, TP4/TP5: never. Following the posts as written (five scale-out targets, ~4.5% stop) has an EV around −3.5…−4% per trade unleveraged — and the advertised ×13–25 leverage turns a single stop into −60…−100% of margin. The marketing shows the 44%; subscribers eat the rest.
+
+**The entry zone is a wall of subscriber limit orders — bimodally.** The "from–to" range either holds price cleanly (breach ≤ 0.8%) or gets knifed straight through by 6.8–7.7% — past the stop level every subscriber placed at the same price. The two strongest signals of the month never revisited the zone at all (+11.2%, +6.6%): a strict "price in zone" entry gate silently discards the best trades.
+
+**All realized profit came from exit engineering, not the seller's targets.** Level-ratchet trailing alone: −0.31% on the month. Adding a structural breakeven rule (stop to entry after 50% progress to TP1): +3.37% — 7 ratchet wins (+7.84%), 8 breakeven zeros, one honest −4.47% stop. The ratchet slack (0.3 of the grid step) is derived from the process distribution, not fitted to PnL: the noise ceiling of survived retraces was 0.186 (n=62).
+
+<Note>
+**Hypothesis-grade results.** These findings come from one month of data, 16–18 events per claim. That is enough to form a hypothesis and reproduce the method — not enough to call it proof. Every number above is reproducible from `measure-items` + `candle-items` via the scripts shipped in `content/*/assets/`. The repo says so out loud; so does this documentation.
+</Note>
+
+## What This Project Is NOT
+
+- **Not a promise of profit.** One month of signals is a hypothesis, not a track record.
+- **Not a production trading system.** There is no `live.module.ts` shipped — you supply your own exchange integration with API keys.
+- **Not a generalizable result.** The findings above are specific to one channel (`crypto_yoda_channel`) over one month. The method generalizes; the numbers do not.
+- **Not a plug-and-play bot.** Every channel has its own format. You must derive the schema, prompt, entry rules, and position management from the author's actual posts — nothing is invented from templates.
+
+## The Core Design Principle
+
+Every signal channel has its own guidance format. Not only "range + 5 targets + stop": a channel may give one target, targets in percentages, only a direction, an averaging grid, or signals as chart screenshots. Therefore, for each channel you design your own LLM schema, prompt, entry rules, and position management — **derived from the author's actual posts, nothing invented**.
+
+The two shipped channels are worked examples of opposite formats:
+
+<CardGroup cols={2}>
+  <Card
+    title="crypto_yoda_channel"
+    icon="text"
+    href="/channels/crypto-yoda"
+  >
+    Classic text signals: entry range + 5 take-profit targets + hard stop. Uses a nested LLM schema, level-ratchet trailing, and a structural breakeven rule.
+  </Card>
+  <Card
+    title="vershinin_trader"
+    icon="image"
+    href="/channels/vershinin-trader"
+  >
+    Vision signals: no ranges, no targets, no stops. The author posts charts and announces closes separately. Uses a dual LLM pipeline — one for opens, one for closes — both fed images.
+  </Card>
+</CardGroup>
+
+## Two Channels, Two Formats
+
+### crypto_yoda_channel — "range + 5 targets + stop"
+
+Classic signal format: `ЛОНГ в диапазоне $78600 - $79400`, five take-profit levels, hard stop. The strategy:
+
+- Parses `entryRange {from, to}`, `targets[5]` (strictly typed via `items: {type:"number"}`), and `stoploss` into a nested schema.
+- Enters at market on any post ≤ 15 minutes old (5m cache interval — the edge lives near publication, and momentum signals never pull back into the zone).
+- Puts the exchange TP on the **farthest** target (direction-aware: `max` for long, `min` for short) and rides a **level ratchet**: every target crossed becomes a floor, a retrace beyond the last taken level by more than 30% of the local grid step closes the position. The slack is adaptive to grid density.
+
+### vershinin_trader — "I'm in, I'm out" with screenshots
+
+No ranges, no targets, no stops. The author enters "at current levels", posts charts and exchange position cards, and announces closes in separate posts. The strategy runs **two independent LLM pipelines**:
+
+- **Open** (`listenIdlePing` → `commitCreateSignal` + `Position.moonbag`, own 7.5% hard stop): the model scans the whole 4h window (tickers come bare — `BTC`, `1000PEPE`) and returns `long | short | wait`.
+- **Close** (`listenActivePing` → `commitClosePending`): `close` only when the author closes this symbol or everything at once; partial fixes, stop moves, and breakevens are `hold`.
+
+Both pipelines feed the model **images** — three kinds found by actually looking at the channel posts: TradingView position-tool charts (direction = green TP zone above/below entry), BYDFi share cards, and exchange position panels (direction written as *Лонг/Шорт*). The prompts explicitly warn about the classic trap: **a green P&L number on a short is profit, not "long"**.
+
+## LLM as a Parser, Not an Oracle
+
+The LLM's job here is narrow and well-defined: extract structured data from a natural-language post. It is not predicting markets.
+
+[json-inference](https://github.com/tripolskypetr/json-inference) is the fix for Ollama's broken structured output. Cloud models ignore the `format` parameter and answer with markdown fences or arrays — `JSON.parse` dies. json-inference passes the schema through as `provide_answer` tool-call parameters: the tool grammar forces a valid object, responses are validated recursively and retried on mismatch. `ollama.chat` with `format` is never called directly.
+
+The model is not deterministic, but the numbers are. Comparing two cache generations over identical inputs: verdicts and every numeric field matched bit-for-bit; only the free-text `reasoning` (and its language) wandered. The tool grammar pins the structure; prices are copied from the post.

@@ -1,0 +1,97 @@
+---
+title: "Strategy Constants and Threshold Calibration"
+sidebarTitle: "Constants"
+description: "Reference for all numeric constants used in both channel strategies, including the doctrine for deriving thresholds from process distributions rather than overfitting to trade outcomes."
+---
+
+## Overview
+
+Both channel strategies in this project use a small set of named numeric constants that control position management behavior. This page documents each constant, where it lives, what it controls, and — most importantly — how to derive or revise one correctly.
+
+---
+
+## `crypto_yoda_channel` Constants
+
+| Constant | Value | Where defined | Meaning |
+|---|---|---|---|
+| `LEVEL_DRIFT_RATIO` | `0.3` | `main.strategy.ts` | Ratchet slack as a fraction of the grid step. If price retreats from the last reached level by more than `LEVEL_DRIFT_RATIO × step`, the position is closed by the trailing ratchet. |
+| `FRESH_WINDOW_MINUTES` | `15` | `main.strategy.ts` | Maximum post age for entry and the scrape lookback window. Posts older than 15 minutes are excluded; the LLM is not consulted if no fresh post is found. |
+| Cache interval | `"5m"` | `Cache.file` options in `main.strategy.ts` | How often the LLM is consulted per symbol in production. One cached result is reused across all ticks within each 5-minute bucket. |
+| `BREAKEVEN_TP1_PROGRESS` | `0.5` | `main.test.ts` | Move stop to entry after the position has covered 50% of the distance from entry to TP1. |
+| `STAGNATION_LOG_INTERVAL_MINUTES` | `15` | `main.test.ts` | Throttle for `Log.debug("crypto_yoda trailing stagnation")` — emits at most once every 15 minutes per open position. |
+
+---
+
+## `vershinin_trader` Constants
+
+| Constant | Value | Where defined | Meaning |
+|---|---|---|---|
+| `WINDOW_MINUTES` | `240` (4 hours) | `main.strategy.ts` | Scrape window for the LLM lookback. In this test version, 4 hours; production would use 15 minutes. |
+| `HARD_STOP_PERCENT` | `7.5` | `main.strategy.ts` | Hard stop-loss percentage applied via `Position.moonbag`. Used because the vershinin channel author does not publish explicit stop levels. |
+| Cache interval | `"4h"` | `Cache.file` options in `main.strategy.ts` | LLM consultation frequency in test mode — one response per 4-hour window per symbol. |
+
+---
+
+## The Threshold Calibration Doctrine
+
+From `CLAUDE.md`:
+
+### 1. Structural rules beat magic numbers
+
+A rule derived from the geometry of the signal has no fitted parameters. The breakeven trigger at `BREAKEVEN_TP1_PROGRESS = 0.5` is an example: once a position has covered half the distance to TP1 it will survive a full reversal to entry without loss. This is a geometric constraint — no amount of backtesting can make it "wrong" within its own definition. Prefer this class of rule over any number that had to be tuned.
+
+### 2. Numbers come from process distributions, not trade outcomes
+
+A number that makes last month look good is a coincidence, not a rule. Before a numeric constant is written into strategy code, it must be measured from an observable distribution of the process itself — independent of whether individual trades were profitable. The `LEVEL_DRIFT_RATIO` example below illustrates this concretely.
+
+### 3. Any candidate constant must survive walk-forward
+
+A single month of backtest results (typically 15–18 trades) provides no statistical power. Before trusting a constant, expand the frame to 4–6 months in `modules/backtest.module.ts`, then run:
+
+- **`Sweep`** (grid search) — enumerate candidate values across the full frame.
+- **`Walker`** (rolling optimization + out-of-sample test) — optimize on a window of N months, check on month N+1, roll forward.
+
+Both tools are available from `backtest-kit`. A constant that does not survive both is not ready.
+
+### 4. Never optimize on a single month
+
+15–18 trades provide no statistical power. A constant that maximizes PnL over one month is curve-fitting, not calibration.
+
+---
+
+## Worked Example: How `LEVEL_DRIFT_RATIO = 0.3` Was Derived
+
+This is the only numeric constant in `crypto_yoda_channel` that required explicit calibration. The derivation follows the doctrine above exactly.
+
+**What it controls.** After the price reaches a ratchet level, `LEVEL_DRIFT_RATIO` determines how far back price can fall before the position is closed. A value of `0.3` means: if price retreats by more than 30% of the distance between two adjacent grid levels, close.
+
+**Step 1 — Collect raw measurements from real runs.**
+
+`main.test.ts` emits `Log.debug("crypto_yoda trailing drift", { driftRatio, ... })` on every active tick where drift > 0. These records accumulate in `dump/log/log.jsonl` during backtests.
+
+**Step 2 — Separate survived retraces from terminal ones.**
+
+The `backtest.jsonl` dump records `closeReason` for every closed position. By joining the two files on `signalId`, each drift observation can be labeled:
+
+- **Survived**: the position reached a higher level after this drift reading (a `level_up` event followed).
+- **Terminal**: this was the peak drift before the position was eventually stopped or ratchet-closed.
+
+**Step 3 — Measure the noise ceiling.**
+
+The percentile distribution of `driftRatio` values among **survived** retraces (those followed by a `level_up`) gives a noise ceiling: the maximum drift that a healthy, still-advancing position ever exhibited before continuing upward.
+
+In the August 2026 backtest frame: `n = 62` survived retraces, 99th-percentile `driftRatio = 0.186`.
+
+**Step 4 — Choose a conservative threshold above the ceiling.**
+
+Any threshold between `0.2` and `0.3` would not have closed any of the 62 live positions that eventually went on to reach the next level. The value `0.3` was chosen at the conservative end of this range:
+
+```
+noise ceiling: 0.186
+safe range:    0.20 – 0.30
+chosen value:  0.30  (LEVEL_DRIFT_RATIO)
+```
+
+**What makes this valid.** The threshold was not chosen to maximize monthly PnL — it was chosen to be above the empirical noise floor of the process. Any value in the `0.20–0.30` range would have the same property. The choice of `0.3` (rather than `0.2`) adds extra slack and is deliberately conservative.
+
+**When to recalibrate.** If the frame is expanded and new data shows that the 99th-percentile noise ceiling has shifted — for example, to `0.25` — then `LEVEL_DRIFT_RATIO` should be re-examined. The re-derivation procedure is the same: collect drift logs, label survived vs. terminal, find the new ceiling, pick a conservative value above it.

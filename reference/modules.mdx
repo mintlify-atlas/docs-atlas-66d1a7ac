@@ -1,0 +1,166 @@
+---
+title: "Exchange and Frame Modules: backtest.module.ts and paper.module.ts"
+sidebarTitle: "Modules"
+description: "Reference for the exchange schema modules that register Binance spot data through ccxt, the August 2026 backtest frame, and how to bring your own live.module.ts."
+---
+
+## Overview
+
+The `modules/` directory contains the exchange-schema registrations used by `loader.config.ts`. Each module calls `addExchangeSchema` (and, in the backtest case, `addFrameSchema`) from `backtest-kit`. The loader reads the **first** registered schema from each registry, so only one exchange module should be imported per run.
+
+| Module | Registers exchange | Registers frame | Order execution |
+|--------|-------------------|-----------------|-----------------|
+| `backtest.module.ts` | ✅ `ccxt-exchange` | ✅ `aug_2026_frame` | ❌ |
+| `paper.module.ts` | ✅ `ccxt-exchange` | ❌ | ❌ |
+| `live.module.ts` | user-supplied | ❌ | ✅ (user-supplied) |
+
+---
+
+## `backtest.module.ts`
+
+### Exchange Schema
+
+Registers a **public Binance spot** exchange via ccxt — no API keys required:
+
+```ts
+import { addExchangeSchema, addFrameSchema, roundTicks } from "backtest-kit";
+import { singleshot } from "functools-kit";
+import ccxt from "ccxt";
+
+const getExchange = singleshot(async () => {
+  const exchange = new ccxt.binance({
+    options: {
+      defaultType: "spot",
+      adjustForTimeDifference: true,
+      recvWindow: 60000,
+    },
+    enableRateLimit: true,
+  });
+  await exchange.loadMarkets();
+  return exchange;
+});
+
+addExchangeSchema({
+  exchangeName: "ccxt-exchange",
+  getCandles: async (symbol, interval, since, limit) => { ... },
+  getOrderBook: async (symbol, depth, _from, _to, backtest) => { ... },
+  getAggregatedTrades: async (symbol, from, to) => { ... },
+  formatPrice: async (symbol, price) => { ... },
+  formatQuantity: async (symbol, quantity) => { ... },
+});
+```
+
+The ccxt instance is created once via `singleshot` (lazy singleton) and reused across all calls.
+
+### Methods
+
+**`getCandles(symbol, interval, since, limit)`**
+
+Wraps `exchange.fetchOHLCV`. Returns an array of candle objects:
+
+```ts
+{ timestamp, open, high, low, close, volume }
+```
+
+**`getOrderBook(symbol, depth, _from, _to, backtest)`**
+
+<Note>
+`getOrderBook` throws an error in backtest mode by design — order book simulation is not implemented. If you call `getOrderBook` from a strategy running under `--backtest`, you will see: `"Order book fetching is not supported in backtest mode for the default exchange schema. Please implement it according to your needs."`
+
+In live/paper mode it delegates to `exchange.fetchOrderBook` and returns `{ symbol, asks, bids }` with prices and quantities as strings.
+</Note>
+
+**`getAggregatedTrades(symbol, from, to)`**
+
+Calls the Binance-specific `publicGetAggTrades` endpoint. Returns:
+
+```ts
+{ id: string, price: number, qty: number, timestamp: number, isBuyerMaker: boolean }[]
+```
+
+This method is Binance-specific and is used by event-study scripts in `content/*/assets/`. It is **not present** in `paper.module.ts`.
+
+**`formatPrice(symbol, price)`** / **`formatQuantity(symbol, quantity)`**
+
+Both use `roundTicks` with the market's `limits.price.min` (tick size) or `precision.price` (step size) from the loaded ccxt market data. Return a **string**.
+
+### Frame Schema
+
+```ts
+addFrameSchema({
+  frameName: "aug_2026_frame",
+  interval: "1m",
+  startDate: new Date("2026-08-01T00:00:00Z"),
+  endDate: new Date("2026-08-31T23:59:59Z"),
+  note: "August 2026",
+});
+```
+
+The frame defines the replay window for `--backtest` runs. The candle cache (`--cache`) downloads `1m` candles for this exact date range.
+
+---
+
+## `paper.module.ts`
+
+`paper.module.ts` is nearly identical to `backtest.module.ts` with two differences:
+
+1. **No `getAggregatedTrades`** — the method is omitted entirely.
+2. **No `addFrameSchema`** — paper mode runs against live market data; no replay frame is needed.
+
+The registered `exchangeName` is still `"ccxt-exchange"`, so the loader wires it identically to the backtest module at the schema level. The Binance ccxt instance is configured the same way (public spot, rate-limited).
+
+Because both modules use `Live.background` under the hood (see [Loader Config](/reference/loader-config)), the distinction between `--live` and `--paper` comes entirely from which module the strategy imports — not from the loader flags themselves.
+
+---
+
+## `live.module.ts` — Bring Your Own
+
+`live.module.ts` is **intentionally not provided** in this project. Real-money trading requires API keys, order execution logic, and account-specific risk parameters that belong in your own codebase. The expected workflow is to copy a working `live.module.ts` from another project.
+
+### Requirements for a compatible `live.module.ts`
+
+| Requirement | Detail |
+|-------------|--------|
+| `exchangeName` | Must be `"ccxt-exchange"`, **or** you must update `loader.config.ts` to use a different name consistently. Only one exchange schema may be registered per run. |
+| Candle format | `getCandles` must return `{ timestamp, open, high, low, close, volume }` objects. |
+| `formatPrice` / `formatQuantity` | Must return **strings**. |
+| Order execution | Must include real order methods (place, cancel, query) — the backtest/paper modules only provide data and formatting. |
+| Authentication | API key and secret are managed inside `live.module.ts`; they are never referenced by the loader. |
+
+---
+
+## Extending the Frame
+
+To replay a different time period:
+
+1. Edit `frameName`, `startDate`, and `endDate` in `backtest.module.ts`:
+
+```ts
+addFrameSchema({
+  frameName: "sep_2026_frame",          // new name → fresh candle set
+  interval: "1m",
+  startDate: new Date("2026-09-01T00:00:00Z"),
+  endDate: new Date("2026-09-30T23:59:59Z"),
+  note: "September 2026",
+});
+```
+
+2. Re-run with `--cache` to download candles for the new date range:
+
+```bash
+npm start -- --backtest --cache --entry ./content/crypto_yoda_channel/main.strategy.ts
+```
+
+Changing the `frameName` causes the engine to look for a fresh candle set in MongoDB. Existing `aug_2026_frame` candles are unaffected.
+
+---
+
+## Extending the Exchange
+
+To replay data from a different exchange:
+
+1. Replace `new ccxt.binance(...)` with another ccxt instance in `backtest.module.ts`.
+2. Adjust the `formatPrice` / `formatQuantity` logic if the target exchange uses a different precision field layout in its market objects.
+3. Remove or stub `getAggregatedTrades` if the target exchange does not have an equivalent endpoint — it is Binance-specific.
+
+Keep `exchangeName: "ccxt-exchange"` unless you also update every strategy file and `loader.config.ts` to use the new name.

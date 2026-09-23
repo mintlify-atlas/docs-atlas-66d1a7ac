@@ -1,0 +1,235 @@
+---
+title: "Step 3: Run the Test Strategy Over a Full Month"
+sidebarTitle: "Test Strategy"
+description: "Use a 4-hour cache interval and a full month backtest to debug the LLM prompt in practice, collect measure-items, and analyze model output quality before going to production."
+---
+
+## Purpose: Debug the Prompt in Practice, Not Profitability
+
+The test strategy is **not** meant to be profitable. With a 4-hour cache interval, it enters positions hours late — far past the edge that lives near the moment of publication. That is intentional.
+
+The goal of this step is:
+- Exercise the prompt over an entire month of real posts, not just the handful tested in Step 2
+- Collect every LLM response as a `measure-item` in MongoDB for inspection
+- Validate that the model is extracting positions, prices, and IDs correctly across all signal types
+- Surface `GET_SIGNAL_FN thrown` errors (schema mismatches, Telegram flooding) in a safe backtest environment before going live
+
+<Note>
+The 4-hour cache interval covers the full month's history cheaply: the LLM is called once per 4-hour window per symbol, not once per minute. A full-month backtest costs tens of LLM calls, not thousands.
+</Note>
+
+## Set Up main.test.ts
+
+Copy `main.test.ts` from a sibling channel (crypto_yoda has the full reference version), then:
+
+1. Change `CHANNEL_NAME` to your channel
+2. Plug in your schema (`TradingPositionFormat`) from Step 2
+3. Keep the cache interval at `"4h"` and the scrape window at 4 hours
+
+The critical `Cache.file` call in the test strategy:
+
+```typescript
+const getSignal = Cache.file(
+  async (symbol: string, when: Date) => {
+    const coin = `#${symbol.replace("USDT", "")}`;
+
+    let messages = await scrapeLookback({
+      channel: CHANNEL_NAME,
+      when,
+      limit: 60 * 4,       // 4 hours in minutes
+      dimension: "minute",
+    });
+
+    messages = messages
+      .filter(({ content }) => content.length > 0)
+      .filter(({ content }) => content.includes(coin));
+
+    if (!messages.length) {
+      return { entry: null };
+    }
+
+    const entry = await generateObject(
+      InferenceName.OllamaInference,
+      {
+        format: TradingPositionFormat,
+        messages: [
+          { role: "user", content: await getPrompt(symbol) },
+          ...messages.map(({ id, channel, date, content }) => ({
+            role: "user" as const,
+            content: str.newline(
+              `ID ${id}`,
+              "",
+              content,
+              "",
+              `[${date.toISOString()}]: https://t.me/${channel}/${id}`,
+            ),
+          })),
+        ],
+      },
+      "gemma4:31b-cloud",
+    );
+
+    return { entry, messages };
+  },
+  {
+    interval: "4h",
+    name: "<channel>_entry_v1",
+  },
+);
+```
+
+## Run the Backtest
+
+```bash
+npm start -- --backtest --ui --entry ./content/<channel>/main.test.ts
+```
+
+To pre-warm candle data (downloads 1m candles for the full frame upfront, speeds up subsequent runs):
+
+```bash
+npm start -- --backtest --ui --entry ./content/<channel>/main.test.ts --cache
+```
+
+The frame dates and symbol list are configured in `modules/backtest.module.ts` (frame) and `config/loader.config.ts` (symbols). Run this command yourself — the strategy process does not launch the backtest.
+
+## What to Check After the Run
+
+### 1. MongoDB measure-items: LLM response quality
+
+Every cached LLM response lands in the `measure-items` collection. Inspect non-null responses to verify the model is parsing correctly:
+
+```javascript
+import mongoose from "mongoose";
+
+const conn = await mongoose.createConnection("mongodb://localhost:27017/backtest-kit").asPromise();
+const db = conn.getClient().db("backtest-kit");
+
+// All non-null model responses for this cache bucket
+const docs = await db.collection("measure-items")
+  .find({
+    bucket: "<channel>_entry_v1_4h_0",
+    "payload.data.entry.position": { $in: ["long", "short"] }
+  })
+  .toArray();
+
+for (const d of docs) {
+  console.log(d.payload.data.entry);
+}
+```
+
+Check manually: positions correct, prices match the post, `id` points to the right message, `symbol` is normalized to `XYZUSDT` format.
+
+### 2. Quick bucket listing with read-cache.mjs
+
+The `assets/read-cache.mjs` script (from crypto_yoda, copy to your channel) provides two modes:
+
+```bash
+# List all cache buckets and their record counts
+node assets/read-cache.mjs
+
+# Inspect all non-null model verdicts for a specific bucket
+node assets/read-cache.mjs <channel>_entry_v1_4h_0
+```
+
+Output for the second mode is tab-separated: `symbol | timestamp | position | post=<id> | entryRange | sl=<stop> | targets=[...]` followed by the model's `reasoning`.
+
+```javascript
+// read-cache.mjs excerpt — the core inspection query
+const docs = await col
+  .find({ bucket, "payload.data.entry": { $ne: null } })
+  .sort({ entryKey: 1 })
+  .toArray();
+
+for (const d of docs) {
+  const e = d.payload.data.entry;
+  const [symbol, ts] = d.entryKey.split("_");
+  const when = new Date(parseInt(ts)).toISOString().slice(0, 16);
+  console.log([symbol, when, e.position, `post=${e.id}`, `sl=${e.stoploss}`, `targets=[${e.targets}]`].join("\t"));
+  console.log(`  ${e.reasoning}\n`);
+}
+```
+
+### 3. dump/report/backtest.jsonl: opened and closed events
+
+The dump file records every lifecycle event. Filter to the relevant actions:
+
+- `action: "opened"` — an entry was made: check `signalId`, `position`, `priceOpen`, `priceTakeProfit`, `priceStopLoss`, `payload` (which carries `levels` in the crypto_yoda format), and `note` (full JSON with the parsed entry and source post)
+- `action: "closed"` — includes `closeReason`, `duration`, `pnl`, `peakProfitPercentage`
+- Ignore `action: "idle"` entries — they make up ~98% of the file and contain only `currentPrice`
+
+### 4. Error log: GET_SIGNAL_FN thrown
+
+Any exception thrown inside the `getSignal` function surfaces in the logs as `GET_SIGNAL_FN thrown`. Common causes:
+
+- Schema mismatch — the model returned something the schema doesn't accept; fix the schema or the prompt
+- Telegram flooding — `FLOOD_WAIT` error from gramjs; the scrape window is too wide or too frequent
+- Missing or wrong `items` on an array field — the model returns mixed types and validation fails
+
+**Fix → increment cache name → rerun.** Never reuse a cache name after changing the schema or prompt.
+
+## main.test.ts as a Snippet Library
+
+`main.test.ts` contains everything that was useful during development but excluded from the production strategy. Copy from it — do not rewrite:
+
+**Per-signal `State`** (level ratchet tracking):
+```typescript
+const LEVEL_STATE = new State({
+  initialData: { lastLevel: 0 },
+  name: "level_state",
+});
+```
+
+**Structural breakeven** (`commitBreakeven` + `BREAKEVEN_STATE`):
+```typescript
+const BREAKEVEN_STATE = new State({
+  initialData: { breakevenSet: false },
+  name: "breakeven_state",
+});
+
+// Inside listenActivePing:
+const progressToTp1 = getProgress(data.position, data.priceOpen, levels[0], currentPrice);
+if (progressToTp1 >= BREAKEVEN_TP1_PROGRESS) {
+  const moved = await commitBreakeven(data.symbol);
+  if (moved) {
+    await BREAKEVEN_STATE.setState({ breakevenSet: true });
+  }
+}
+```
+
+**Log telemetry for threshold tuning** — `Log.info` for level transitions, `Log.debug` for dense measurement streams (drift on every ping when `drift > 0`; stagnation throttled every 15 minutes):
+```typescript
+Log.info("crypto_yoda trailing level_up", {
+  signalId: data.id,
+  symbol: data.symbol,
+  position: data.position,
+  lastLevel,
+  currentLevel,
+  levelPrice: levels[currentLevel - 1],
+  currentPrice,
+  when: when.toISOString(),
+});
+
+if (drift > 0) {
+  Log.debug("crypto_yoda trailing drift", {
+    signalId: data.id,
+    drift,
+    step,
+    driftRatio,
+    driftRatioLimit: LEVEL_DRIFT_RATIO,
+    when: when.toISOString(),
+  });
+}
+```
+
+Log records land in `dump/log/log.jsonl` and are used to tune thresholds from process distributions — not from P&L outcomes.
+
+## When the Test Run Is Good
+
+Move to Step 4 when:
+- All non-null `measure-items` look correct on manual inspection (right position, right prices, right source ID)
+- The error log has no `GET_SIGNAL_FN thrown` entries
+- Opened/closed events in `backtest.jsonl` show plausible entries with correctly serialized `payload`
+
+## Next Step
+
+With a validated prompt producing correct extractions across a full month of posts, you are ready to convert to the production strategy. Proceed to [Step 4: Ship the Production Strategy with 5-Minute Cache](/guides/production-strategy).

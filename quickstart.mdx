@@ -1,47 +1,128 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with backtest-ollama-casual"
+sidebarTitle: "Quickstart"
+description: "Install dependencies, authorize Telegram, start MongoDB and Ollama, then run your first backtest against a signal channel in under 10 minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+<Warning>
+  The backtest command and the Telegram `signIn()` call **must be run by you, the user** — both are interactive processes. The `signIn()` flow displays a QR code in your terminal; the backtest command streams live output that you monitor as it runs. Neither can be automated or delegated.
+</Warning>
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+### Prerequisites
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+Before you begin, make sure the following are available on your machine:
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
-</Steps>
+- **Node.js 18+** — the project uses ES modules and top-level await.
+- **Docker** — MongoDB and Redis run as Docker Compose services.
+- **Ollama** with `gemma4:31b-cloud` pulled:
+
+  ```bash
+  ollama pull gemma4:31b-cloud
+  ```
+
+  `gemma4:31b-cloud` is the model used across all LLM parsing pipelines (text and vision). No other model is tested or configured.
+
+### Install Dependencies
+
+From the project root:
+
+```bash
+npm install
+```
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+  After **any** `npm install`, immediately run the following to restore the `sharp` platform binary:
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+  ```bash
+  npm install --include=optional sharp
+  ```
+
+  npm removes optional dependencies during installs. Without the platform-native `sharp` binary, `telegram-reader` will fail at runtime with "Could not load the sharp module". Run this after every install — including the first one.
 </Tip>
+
+### Start Infrastructure
+
+The project requires MongoDB (for candle and LLM-cache storage) and Redis (for inter-process coordination). Start them with Docker Compose:
+
+```bash
+# MongoDB on port 27017
+docker compose -f docker/mongo/docker-compose.yaml up -d
+
+# Redis on port 6379
+docker compose -f docker/redis/docker-compose.yaml up -d
+```
+
+Then start the Ollama server in the background (if it is not already running):
+
+```bash
+ollama serve
+```
+
+MongoDB stores two collections used by every backtest: `candle-items` (1m OHLCV, warmed by `--cache`) and `measure-items` (the persisted LLM response cache). Redis is used for coordination between the per-symbol background processes.
+
+### Authorize Telegram
+
+The engine uses a Telegram userbot session ([telegram-reader](https://www.npmjs.com/package/telegram-reader)) to read channel posts. The session file (`session.txt`) is shared between all channels, so you only need to do this once per machine.
+
+Run `signIn()` from **inside the channel folder** — the session file is written to the current working directory:
+
+```bash
+cd content/crypto_yoda_channel
+node -e 'require("telegram-reader").signIn()'
+```
+
+A QR code will appear in your terminal. Scan it in Telegram: go to **Settings → Devices → Link Desktop Device**. If two-factor authentication is enabled, you will be prompted for your password. The session is saved to `./session.txt` and reused automatically on all subsequent runs.
+
+<Note>
+  The `session.txt` file is shared across all channels. If you have already authorized on this machine (e.g. you ran `signIn()` in `content/vershinin_trader/`), you can simply copy the file:
+
+  ```bash
+  cp content/vershinin_trader/session.txt content/crypto_yoda_channel/session.txt
+  ```
+
+  No need to re-authenticate — any valid `session.txt` in the channel folder works.
+</Note>
+
+### Run Your First Backtest
+
+Run the backtest for the `crypto_yoda_channel` worked example. The `--ui` flag opens the interactive dashboard:
+
+<CodeGroup>
+
+```bash Standard (no candle pre-warm)
+npm start -- --backtest --ui --entry ./content/crypto_yoda_channel/main.strategy.ts
+```
+
+```bash With --cache (pre-warm candles into MongoDB)
+npm start -- --backtest --ui --entry ./content/crypto_yoda_channel/main.strategy.ts --cache
+```
+
+</CodeGroup>
+
+The `--cache` variant downloads all 1m OHLCV candles for the backtest frame into MongoDB before replaying. This makes subsequent replays significantly faster since candle data is served locally. Use it on your first run of a given channel, or after extending the backtest frame.
+
+The `--entry` flag takes the path to the channel's strategy file. To backtest `vershinin_trader` instead, substitute the path:
+
+```bash
+npm start -- --backtest --ui --entry ./content/vershinin_trader/main.strategy.ts
+```
+
+Backtest reports are written to `content/<channel>/dump/report/` as JSONL files. The main file is `backtest.jsonl`: one line per lifecycle event (`opened`, `active`, `closed`). Forensic scripts for each channel live in `content/*/assets/`.
+
+### Go Live
+
+To switch from backtesting to live mode, replace `--backtest` with `--live`:
+
+```bash
+npm start -- --live --entry ./content/crypto_yoda_channel/main.strategy.ts
+```
+
+<Warning>
+  There is no `live.module.ts` shipped with this project. Live mode requires an exchange module with real order execution and API key management. You supply that yourself by copying from your own existing project and wiring it to the `"ccxt-exchange"` exchange name used throughout. Verify that your `getCandles` response shape matches `{ timestamp, open, high, low, close, volume }` and that `formatPrice`/`formatQuantity` return strings.
+</Warning>
+
+The symbols traded in any mode are hardcoded in `config/loader.config.ts` (`SYMBOL_LIST`). Each symbol runs as its own independent `Backtest.background` (or `Live.background`) context, filtering the channel for its ticker and maintaining its own LLM cache keyed `SYMBOL_timestamp`.
+
+</Steps>

@@ -1,0 +1,170 @@
+---
+title: "CLI Entry Point: loader.config.ts and Command-Line Flags"
+sidebarTitle: "Loader Config"
+description: "Reference for config/loader.config.ts: the --entry, --backtest, --live, --paper, and --cache flags, SYMBOL_LIST, and how the loader wires strategy, exchange, and frame schemas."
+---
+
+## Overview
+
+`config/loader.config.ts` is the single CLI entry point for every run mode in the project. It is loaded by `@backtest-kit/cli`, which is invoked via:
+
+```bash
+node ./node_modules/@backtest-kit/cli/build/index.mjs
+```
+
+All project-specific flags are passed **after** `--`, and the `package.json` `start` script wraps that invocation as `npm start`:
+
+```bash
+npm start -- --backtest --entry ./content/crypto_yoda_channel/main.strategy.ts
+```
+
+---
+
+## Command-Line Flags
+
+| Flag | Type | Default | Effect |
+|------|------|---------|--------|
+| `--entry` | boolean | `false` | **Required.** Signals that a strategy file has been loaded via `@backtest-kit/cli`'s `--entry <path>` mechanism. Without it the loader returns immediately without starting any run. |
+| `--backtest` | boolean | `false` | Replay mode. Runs `Backtest.background` per symbol. Requires a registered frame schema (`addFrameSchema` must have been called by the `--entry` file). |
+| `--live` | boolean | `false` | Live trading mode. Runs `Live.background` per symbol using the registered exchange schema. |
+| `--paper` | boolean | `false` | Paper trading mode. Follows the **same code path as `--live`** (both call `Live.background`). The difference between live and paper lives entirely in which exchange module is loaded — `paper.module.ts` uses Binance public data only, with no order execution. |
+| `--cache` | boolean | `false` | Pre-warms 1-minute candles from Binance for every symbol in `SYMBOL_LIST`. Only valid together with `--backtest` (the loader checks for `frameSchema` before starting the download). |
+
+<Note>
+`--entry` is parsed as a `boolean` flag by `parseArgs`, not as a string path. The actual path resolution is handled upstream by `@backtest-kit/cli` before `loader.config.ts` runs.
+</Note>
+
+---
+
+## SYMBOL_LIST
+
+`SYMBOL_LIST` is a hardcoded array defined at the top of `loader.config.ts` and immediately injected into `globalThis`:
+
+```ts
+const SYMBOL_LIST = [
+  "BTCUSDT",
+  "POLUSDT",
+  "ZECUSDT",
+  "HYPEUSDT",
+  "DOGEUSDT",
+  "SOLUSDT",
+  "PENGUUSDT",
+  "TRXUSDT",
+  "HBARUSDT",
+  "NEARUSDT",
+  "FARTCOINUSDT",
+  "ETHUSDT",
+  "PUMPUSDT",
+];
+
+Object.assign(globalThis, { SYMBOL_LIST });
+```
+
+The loader iterates this list and spawns one background worker per symbol (`Backtest.background` or `Live.background`). This is why each strategy instance receives only its own `symbol` when `getSignal` or `listenIdlePing` fires — each copy of the strategy is scoped to a single ticker.
+
+To add or remove symbols, edit this array directly in `loader.config.ts`.
+
+---
+
+## How Schemas Are Discovered
+
+The loader calls the three registry functions and picks the **first** registered entry from each:
+
+```ts
+const [strategySchema]  = await listStrategySchema();
+const [exchangeSchema]  = await listExchangeSchema();
+const [frameSchema]     = await listFrameSchema();
+```
+
+The `--entry` file (and any modules it imports) must call `addStrategySchema`, `addExchangeSchema`, and `addFrameSchema` **before** these `list*` calls resolve. A typical strategy file imports a module that registers the exchange:
+
+```ts
+// inside main.strategy.ts (or its imports)
+import "../../../modules/backtest.module.ts";   // calls addExchangeSchema + addFrameSchema
+addStrategySchema({ strategyName: "main_strategy", getSignal: ... });
+```
+
+If no strategy is registered the loader throws `"Strategy not specified"`. If `--backtest` or `--cache` is requested but no frame is registered it throws `"Frame not specified"`.
+
+---
+
+## Initialization Sequence
+
+Before any schema is read the loader awaits two initialization barriers:
+
+```ts
+await waitForInit();                    // MongoDB connection ready (@backtest-kit/mongo)
+await waitForReady(!!values.backtest);  // framework internals (replay engine in backtest mode)
+```
+
+This ensures MongoDB is available for candle caching and LLM-response persistence before any background worker starts.
+
+---
+
+## Candle Cache Logic (`--cache`)
+
+When both `--backtest` and `--cache` are passed, the loader downloads 1-minute candles for every symbol in `SYMBOL_LIST` before starting the replay:
+
+```ts
+if (values.backtest && values.cache) {
+  await CACHE_CANDLES_FN();
+}
+```
+
+`CACHE_CANDLES_FN` reads the registered exchange and frame schemas to determine the exchange name, date range, and interval:
+
+```ts
+for (const symbol of SYMBOL_LIST) {
+  await cacheCandles({
+    exchangeName: exchangeSchema.exchangeName,   // "ccxt-exchange"
+    from: frameSchema.startDate,
+    to: frameSchema.endDate,
+    interval: "1m",
+    symbol,
+  });
+}
+```
+
+This populates the `candle-items` collection in MongoDB. Subsequent replays read from this cache rather than hitting the Binance API on every tick.
+
+---
+
+## `--live` vs `--paper`: Identical Loader Branches
+
+Both flags call `Live.background` with the same arguments:
+
+```ts
+if (values.live) {
+  Live.background(symbol, {
+    exchangeName: exchangeSchema.exchangeName,
+    strategyName: strategySchema.strategyName,
+  });
+}
+if (values.paper) {
+  Live.background(symbol, {
+    exchangeName: exchangeSchema.exchangeName,
+    strategyName: strategySchema.strategyName,
+  });
+}
+```
+
+The distinction is purely in the loaded module: `paper.module.ts` registers a Binance public-data exchange with no order-execution methods, while `live.module.ts` (provided by the user) registers a fully authenticated exchange. The loader itself has no awareness of which is which.
+
+---
+
+## Example Run Commands
+
+```bash
+# Backtest with frame (requires backtest.module.ts to be loaded by the strategy)
+npm start -- --backtest --ui --entry ./content/crypto_yoda_channel/main.strategy.ts
+
+# Backtest + candle warm (downloads 1m candles for the full frame before replaying)
+npm start -- --backtest --ui --cache --entry ./content/crypto_yoda_channel/main.strategy.ts
+
+# Live mode (requires live.module.ts to be loaded by the strategy)
+npm start -- --live --ui --entry ./content/crypto_yoda_channel/main.strategy.ts
+```
+
+<Note>
+The user runs these commands manually. The loader itself does not invoke `npm start` — it is the process being started.
+</Note>

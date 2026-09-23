@@ -1,0 +1,177 @@
+---
+title: "Configure Symbols, Frames, and Runtime Modes"
+sidebarTitle: "Configuration"
+description: "How SYMBOL_LIST, backtest frames, exchange schema, and the three runtime modes (backtest, paper, live) are wired together through config/loader.config.ts and the modules/ directory."
+---
+
+## Overview
+
+The engine's configuration lives in two places:
+
+- **`config/loader.config.ts`** — the CLI entry point that reads flags, picks registered schemas, and spawns per-symbol workers.
+- **`modules/`** — TypeScript files that register exchange and frame schemas before the loader runs.
+
+## SYMBOL_LIST
+
+`SYMBOL_LIST` is hardcoded directly in `config/loader.config.ts`. Edit it by hand to add or remove symbols. Every symbol in the list gets its own parallel `Backtest.background` or `Live.background` call.
+
+```ts
+const SYMBOL_LIST = [
+  "BTCUSDT",
+  "POLUSDT",
+  "ZECUSDT",
+  "HYPEUSDT",
+  "DOGEUSDT",
+  "SOLUSDT",
+  "PENGUUSDT",
+  "TRXUSDT",
+  "HBARUSDT",
+  "NEARUSDT",
+  "FARTCOINUSDT",
+  "ETHUSDT",
+  "PUMPUSDT",
+];
+
+Object.assign(globalThis, { SYMBOL_LIST });
+```
+
+The list is also injected into `globalThis` so strategy code can reference it without importing the config file.
+
+## How the Loader Works
+
+The loader parses four CLI flags with Node's built-in `parseArgs`:
+
+| Flag | Type | Purpose |
+|---|---|---|
+| `--entry` | boolean | Required. Without it the process exits immediately. |
+| `--backtest` | boolean | Replay mode against a registered frame schema. |
+| `--paper` | boolean | Live code path with public Binance data, no real orders. |
+| `--live` | boolean | Live code path with the user-supplied exchange module. |
+| `--cache` | boolean | Pre-warm 1m candles from Binance (only valid with `--backtest`). |
+
+After validating the flags it picks the **first** registered schema from each registry:
+
+```ts
+const [strategySchema] = await listStrategySchema();
+const [exchangeSchema] = await listExchangeSchema();
+const [frameSchema]    = await listFrameSchema();     // only required for --backtest / --cache
+```
+
+<Warning>
+The loader always picks the **first** registered schema. Load exactly one exchange module per run. If two modules call `addExchangeSchema`, only the first registration is used.
+</Warning>
+
+Then it loops over `SYMBOL_LIST` and fires off a background worker per symbol:
+
+```ts
+for (const symbol of SYMBOL_LIST) {
+  if (values.live || values.paper) {
+    Live.background(symbol, {
+      exchangeName: exchangeSchema.exchangeName,
+      strategyName: strategySchema.strategyName,
+    });
+    continue;
+  }
+  if (values.backtest) {
+    Backtest.background(symbol, {
+      exchangeName: exchangeSchema.exchangeName,
+      strategyName: strategySchema.strategyName,
+      frameName: frameSchema.frameName,
+    });
+    continue;
+  }
+}
+```
+
+## The Three Runtime Modes
+
+### `--backtest`
+
+Replays history against a registered frame schema. Requires `addFrameSchema` to be present in the loaded module. When combined with `--cache`, the loader pre-warms 1m OHLCV candles from Binance into MongoDB before the replay starts:
+
+```ts
+if (values.backtest && values.cache) {
+  await CACHE_CANDLES_FN();   // fetches 1m candles for every symbol over the frame window
+}
+```
+
+All workers call `Backtest.background`. The LLM cache is also active — each symbol's per-tick cache key is `SYMBOL_timestamp` (milliseconds).
+
+### `--paper`
+
+Uses the same `Live.background` code path as `--live`. The difference lives entirely in the loaded exchange module: `modules/paper.module.ts` registers a read-only Binance schema with no order-execution methods (`getCandles`, `getOrderBook`, `formatPrice`, `formatQuantity` only). Real Binance market data streams in; no orders are sent.
+
+### `--live`
+
+`Live.background` with the user-supplied exchange module (`modules/live.module.ts` or equivalent). That module is not included in the repository — copy it from another project and verify that `exchangeName`, candle format `{ timestamp, open, high, low, close, volume }`, and `formatPrice`/`formatQuantity` return types all match.
+
+## `addFrameSchema` and the Backtest Period
+
+`modules/backtest.module.ts` registers both the exchange schema and the frame:
+
+```ts
+addFrameSchema({
+  frameName: "aug_2026_frame",
+  interval:  "1m",
+  startDate: new Date("2026-08-01T00:00:00Z"),
+  endDate:   new Date("2026-08-31T23:59:59Z"),
+  note:      "August 2026",
+});
+```
+
+| Field | Purpose |
+|---|---|
+| `frameName` | Unique identifier. Used as the `frameName` key in dump reports. |
+| `interval` | Candle resolution for the replay clock (always `"1m"` here). |
+| `startDate` | First candle timestamp the engine replays from. |
+| `endDate` | Last candle timestamp. |
+| `note` | Human-readable label, stored in reports. |
+
+### Switching the Backtest Period
+
+1. Edit `startDate` and `endDate` in `modules/backtest.module.ts`.
+2. Change `frameName` to a new string (e.g. `"sep_2026_frame"`). This prevents stale frame references in cached data.
+3. Run with `--cache` to download the new candle window:
+   ```bash
+   npm start -- --backtest --entry ./content/crypto_yoda_channel/main.strategy.ts --cache
+   ```
+
+## The Exchange Schema in `backtest.module.ts`
+
+The exchange schema registered under the name `"ccxt-exchange"` wraps the public ccxt Binance spot client:
+
+```ts
+addExchangeSchema({
+  exchangeName: "ccxt-exchange",
+  getCandles:          async (symbol, interval, since, limit) => { ... },
+  getOrderBook:        async (symbol, depth, _from, _to, backtest) => {
+    if (backtest) throw new Error("Order book not supported in backtest mode");
+    ...
+  },
+  getAggregatedTrades: async (symbol, from, to) => { ... },   // backtest.module.ts only
+  formatPrice:         async (symbol, price)    => { ... },
+  formatQuantity:      async (symbol, quantity) => { ... },
+});
+```
+
+`paper.module.ts` is identical except it omits `getAggregatedTrades` and `addFrameSchema`. Neither module has order-execution methods — those belong in a live module the user provides.
+
+## Module Loading Pattern at a Glance
+
+```
+npm start -- --backtest --entry ./content/crypto_yoda_channel/main.strategy.ts
+              │
+              └─ Node loads loader.config.ts
+                    │
+                    ├─ --entry file is imported (main.strategy.ts)
+                    │     └─ imports modules/backtest.module.ts
+                    │           ├─ addExchangeSchema("ccxt-exchange", ...)
+                    │           └─ addFrameSchema("aug_2026_frame", ...)
+                    │
+                    ├─ listStrategySchema()  → first registered strategy
+                    ├─ listExchangeSchema()  → "ccxt-exchange"
+                    ├─ listFrameSchema()     → "aug_2026_frame"
+                    │
+                    └─ for each symbol in SYMBOL_LIST:
+                          Backtest.background(symbol, { exchangeName, strategyName, frameName })
+```

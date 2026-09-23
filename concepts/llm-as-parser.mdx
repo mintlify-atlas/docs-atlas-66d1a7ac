@@ -1,0 +1,157 @@
+---
+title: "LLM as a Parser: Deterministic Structured Output from Ollama"
+sidebarTitle: "LLM as Parser"
+description: "Why Ollama's format parameter fails for cloud models, how json-inference fixes it with tool-call grammar, and what makes numeric fields deterministic despite model non-determinism."
+---
+
+## The Core Problem
+
+Ollama exposes a `format` parameter for structured JSON output. For locally-hosted models it works as documented. For cloud-routed models like `gemma4:31b-cloud` it is silently ignored.
+
+The model returns its answer wrapped in a markdown fence:
+
+```
+```json
+[]
+```
+```
+
+or as a bare array instead of an object. `JSON.parse` dies on the fence. Even when it parses, the shape does not match the schema.
+
+This was not a hypothesis — it was diagnosed by replaying the exact strategy call on the exact post that triggered the crash, byte for byte. The root cause: cloud models route through a proxy that strips or ignores the `format` parameter before the request reaches the inference engine.
+
+<Warning>
+  Never call `ollama.chat` with a `format` parameter directly. For cloud models it will not enforce structure. The result may parse occasionally, but it will silently diverge from your schema under load, with multi-post windows, or after prompt changes. Always use `generateObject` or `generateText` from `json-inference`.
+</Warning>
+
+## How `json-inference` Fixes It
+
+[`json-inference`](https://github.com/tripolskypetr/json-inference) solves the problem at the protocol level rather than patching the response.
+
+Instead of passing the schema as a `format` parameter, it passes it as the parameter declaration of a `provide_answer` tool call. The model's tool-call grammar — which _does_ apply to cloud models — forces the output to be a valid, schema-conforming JSON object. If the response fails recursive schema validation, the library retries automatically.
+
+The call looks like this in practice (from `crypto_yoda_channel/main.strategy.ts`):
+
+```typescript
+import { generateObject, InferenceName, type FormatModel } from "json-inference";
+
+const TradingPositionFormat = {
+  type: "object",
+  required: ["id", "symbol", "position", "entryRange", "targets", "stoploss", "reasoning"],
+  properties: {
+    id: {
+      type: "number",
+      description: "ID сообщения из которого был сформирован сигнал. " +
+        "Если сигнала нет, верни -1",
+    },
+    symbol: {
+      type: "string",
+      description: "Тикер позиции строго в формате *USDT, например BTCUSDT",
+    },
+    position: {
+      type: "string",
+      enum: ["long", "short", "wait"],
+      description: "Тип позиции. Если позиции нет, верни wait",
+    },
+    entryRange: {
+      type: "object",
+      required: ["from", "to"],
+      properties: {
+        from: { type: "number", description: "Цена входа ОТ" },
+        to:   { type: "number", description: "Цена входа ДО" },
+      },
+    },
+    targets: {
+      type: "array",
+      description: "Цели позиции, 5 уровней, числа. Если сигнала нет, верни []",
+      items: { type: "number" },
+    },
+    stoploss: {
+      type: "number",
+      description: "СТОП ЛОСС, одна точка. Если сигнала нет, верни 0",
+    },
+    reasoning: {
+      type: "string",
+      description: "Строковое описание решения. Будет использовано для отладки",
+    },
+  },
+} satisfies FormatModel;
+
+const entry = await generateObject(
+  InferenceName.OllamaInference,
+  {
+    format: TradingPositionFormat,
+    messages: [
+      { role: "user", content: await getPrompt(symbol) },
+      ...messages.map(({ id, channel, date, content }) => ({
+        role: "user" as const,
+        content: str.newline(
+          `ID ${id}`,
+          "",
+          content,
+          "",
+          `[${date.toISOString()}]: https://t.me/${channel}/${id}`,
+        ),
+      })),
+    ],
+  },
+  "gemma4:31b-cloud",
+);
+```
+
+The `format` property on the options object is the `FormatModel` schema — a plain JSON Schema object. `json-inference` transforms it into the tool parameter declaration and handles retry on mismatch internally.
+
+## Why the Numbers Are Deterministic
+
+The model is not deterministic. Run the same prompt twice and the `reasoning` field will differ — sometimes in content, sometimes in language (Russian vs. English).
+
+But across two full cache generations over identical inputs, every numeric field matched bit-for-bit. Prices (`targets`, `stoploss`, `entryRange.from/to`) are stable because:
+
+1. **The model copies them from the post text.** There is no calculation involved. `$78600 - $79400` becomes `from: 78600, to: 79400`.
+2. **The tool grammar pins the structure.** The schema tells the model exactly what fields exist and what types they must be. There is no room to invent a number that was not in the post.
+
+Only the free-text `reasoning` field, which has no constraint beyond `type: "string"`, wanders between runs. This is expected and harmless — `reasoning` is debug data, not trading logic.
+
+## `FormatModel` Schema Design Rules
+
+These rules come directly from diagnosing failures in production:
+
+**Flat object preferred.** The top-level schema is always `{ type: "object", required, properties }`. Nested objects are supported (e.g. `entryRange: { from, to }`) but nesting beyond one level increases the chance of schema drift.
+
+**`items: { type: "number" }` on all arrays.** Without an explicit `items` declaration, the model may return arrays of strings or mixed types even when the description says "numbers". This was confirmed by an A/B/C/D experiment: four variants of the `targets` array schema produced four different element types. Always declare `items`.
+
+**No defaults — use `description` instead.** Do not rely on schema `default` values. Write the fallback into the field description: `"Если сигнала нет, верни []"`. The description reaches the model; the JSON Schema `default` key does not affect model behavior.
+
+**Always include `id`, `reasoning`, and a wait-state.** `id` links the parsed result back to the source post for validation. `reasoning` exposes model decision-making for prompt debugging. The wait-state (`position: "wait"`, `action: "hold"`) gives the model a legal no-op path, preventing hallucination of signals where none exist.
+
+**`enum` only on string fields.** Enum constraints on numeric or array fields are not handled correctly by the tool grammar. Use `description` to express allowed values for non-string fields.
+
+## Vision Support: Images in Messages
+
+Channels that post charts or exchange screenshots (like `vershinin_trader`) require the model to read images. The `ScraperMessage` object from `telegram-reader` includes a `photo` field — a base64-encoded JPEG preview at 800px.
+
+Attach it to any message in the `messages` array using the `images` field:
+
+```typescript
+messages.map(({ id, channel, date, content, photo }) => ({
+  role: "user" as const,
+  content: str.newline(
+    `ID ${id}`,
+    "",
+    content,
+    "",
+    `[${date.toISOString()}]: https://t.me/c/${channel.slice(4)}/${id}`,
+  ),
+  ...(photo && { images: [photo] }),
+}))
+```
+
+`gemma4:31b-cloud` reads the images. Three types of image were found in practice by actually downloading and examining them (`assets/download-photos.mjs`):
+
+- **TradingView position-tool charts** — direction is the position of the TP zone (above entry = long, below = short)
+- **BYDFi share cards** — direction is written as the word *Лонг* or *Шорт*
+- **Exchange position panels** — direction written explicitly; the classic trap: a green P&L number on a short is profit, not a long signal
+
+Vision prompt rules must be written from real examples — never from imagination about what "trading charts usually look like."
+
+Adding images changes the model's input, which changes its outputs. **A new cache name is required** whenever images are added to or removed from the message array.

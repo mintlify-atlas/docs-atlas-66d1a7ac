@@ -1,0 +1,161 @@
+---
+title: "System Architecture: LLM Pipeline to Event Study"
+sidebarTitle: "Architecture"
+description: "How the Telegram scraper, LLM parser, backtest engine, MongoDB persistence, and forensics toolkit connect into a single reproducible measurement pipeline."
+---
+
+## Overview
+
+`backtest-ollama-casual` is a measurement rig for Telegram trading signal channels. Its job is not to generate alpha from scratch — it is to answer a precise question: **does the signal channel author have a real directional edge, and if so, at what horizon does it live?**
+
+Every component in the pipeline exists to make that answer reproducible and bias-free.
+
+## Top-Level Data Flow
+
+```
+Telegram channel
+      │
+      ▼
+ scrapeLookback()          ← telegram-reader userbot, reads channel history
+      │                       back from `when` without look-ahead
+      ▼
+ Cache.file wrapper         ← deduplicates by 5m bucket + SYMBOL_timestamp;
+      │                       result persisted to measure-items in MongoDB
+      ▼
+ generateObject()           ← json-inference → Ollama (gemma4:31b-cloud)
+      │                       schema passed as tool-call; returns structured DTO
+      ▼
+ Strategy logic             ← entry gate, signal DTO construction,
+      │                       listenIdlePing / getSignal
+      ▼
+ backtest-kit engine        ← replays over 1m candles tick-by-tick;
+      │                       listenActivePing fires every minute while open
+      ▼
+ MongoDB                    ← measure-items (LLM cache)
+      │                          candle-items (1m OHLCV from --cache warm)
+      ▼
+ forensics scripts          ← event-study.mjs, read-cache.mjs, validate.mjs
+```
+
+## Per-Symbol Parallelism
+
+Each symbol in `SYMBOL_LIST` runs as its own independent `Backtest.background` (or `Live.background`) context. The loader iterates over the list and spawns a background execution per symbol:
+
+```typescript
+// config/loader.config.ts
+const SYMBOL_LIST = [
+  "BTCUSDT", "POLUSDT", "ZECUSDT", "HYPEUSDT", "DOGEUSDT",
+  "SOLUSDT", "PENGUUSDT", "TRXUSDT", "HBARUSDT", "NEARUSDT",
+  "FARTCOINUSDT", "ETHUSDT", "PUMPUSDT",
+];
+
+Object.assign(globalThis, { SYMBOL_LIST });
+
+// ...inside main():
+for (const symbol of SYMBOL_LIST) {
+  if (values.backtest) {
+    Backtest.background(symbol, {
+      exchangeName: exchangeSchema.exchangeName,
+      strategyName: strategySchema.strategyName,
+      frameName: frameSchema.frameName,
+    });
+  }
+}
+```
+
+Each background context calls the strategy with that symbol. Because the Telegram scraper filters posts by ticker tag (e.g. `#BTC`, `#PENGU`), each symbol independently extracts only the signals relevant to it. The LLM cache key is `SYMBOL_timestamp`, so cache entries are also per-symbol.
+
+## The Three Runtime Modes
+
+| Flag | Behavior | Module |
+|---|---|---|
+| `--backtest` | Replays strategy over historical 1m candles within the defined frame | `modules/backtest.module.ts` |
+| `--paper` | Live feed from the exchange, simulated orders — no API keys required | `modules/paper.module.ts` |
+| `--live` | Real orders against the exchange | `live.module.ts` (user-supplied) |
+
+Both `--paper` and `--live` call `Live.background` under the hood. The runtime difference lives entirely in which exchange module is loaded — the strategy code is identical across all three modes.
+
+<Note>
+  `live.module.ts` is intentionally not shipped with this repository. Real-money execution requires API keys and order management logic that belongs to your own project. Copy your existing exchange module, verify the `exchangeName` matches `"ccxt-exchange"` (or load only one exchange schema), confirm the candle shape `{ timestamp, open, high, low, close, volume }`, and confirm that `formatPrice`/`formatQuantity` return strings.
+</Note>
+
+The `--cache` flag, used only together with `--backtest`, pre-warms 1m OHLCV candles for all symbols across the full backtest frame into the `candle-items` MongoDB collection before the replay begins. This avoids repeated live exchange calls during replay.
+
+## MongoDB Collections
+
+The engine writes to two collections in `mongodb://localhost:27017/backtest-kit`:
+
+### `measure-items` — LLM Cache
+
+Populated by every `Cache.file` call. Each document stores:
+
+| Field | Value |
+|---|---|
+| `bucket` | Cache name + interval suffix: `"crypto_yoda_entry_v3_5m_0"` |
+| `entryKey` | `"SYMBOL_timestamp"` (milliseconds of the tick) |
+| `payload.data` | Whatever the wrapped function returned — `{ entry, message, url }` or `{ signal, ... }` |
+
+A `null` entry (empty Telegram window, no signal) is still stored — the framework does not call Telegram or the LLM again for the same bucket window.
+
+### `candle-items` — 1m OHLCV
+
+Populated by `--cache` warm. Each document:
+
+| Field | Value |
+|---|---|
+| `symbol` | e.g. `"BTCUSDT"` |
+| `interval` | `"1m"` |
+| `timestamp` | Candle open time in milliseconds |
+| `open/high/low/close/volume` | Standard OHLCV numbers |
+
+The event study scripts query this collection directly to compute directional moves at each horizon after a signal.
+
+## The `Cache.file` Pattern
+
+`Cache.file` is a function wrapper that deduplicates calls by time bucket and name. Without it, `listenIdlePing` (which fires every minute per symbol) would hammer Telegram and the LLM on every tick.
+
+```typescript
+const getSignal = Cache.file(
+  async (symbol: string, when: Date) => {
+    // expensive: scrape Telegram + call LLM
+    ...
+  },
+  {
+    interval: "5m",       // bucket width — one LLM call per 5-minute window
+    name: "crypto_yoda_entry_v3",
+  },
+);
+```
+
+The `interval` drives the deduplication key. In production (`main.strategy.ts`) it is `"5m"` — one Telegram scrape and one LLM call per 5-minute window per symbol. In the test variant (`main.test.ts`) it is `"4h"`, which is useful for covering a full month of posts in one backtest run but would badly delay a real entry.
+
+**Changing the schema, prompt, or selection logic requires a new cache name** (e.g. `v3 → v4`). Old entries keyed under the previous name would otherwise be served from cache even after the model contract changed.
+
+## `loader.config.ts` — CLI Entry Point
+
+`config/loader.config.ts` is the sole CLI entry point. It parses flags, waits for MongoDB, waits for backtest-kit readiness, then dispatches per-symbol background runs.
+
+```
+npm start -- --backtest --ui --entry ./content/crypto_yoda_channel/main.strategy.ts
+```
+
+The `--entry` flag causes Node.js to import the strategy file as a side-effect module. The strategy file calls `addStrategySchema(...)` during import, registering its schema with backtest-kit's global registry. The loader then calls `listStrategySchema()` and takes the first registered schema — so exactly one strategy and one exchange module must be loaded per run.
+
+Modules register their own schemas:
+- `modules/backtest.module.ts` calls `addExchangeSchema` + `addFrameSchema`
+- `modules/paper.module.ts` calls `addExchangeSchema` only (no frame)
+- The strategy file calls `addStrategySchema`
+
+## Forensics Scripts
+
+Each channel ships a set of analysis scripts under `content/<channel>/assets/`:
+
+| Script | Question it answers |
+|---|---|
+| `read-posts.mjs` | What does the author actually post? (formats, tickers, types) |
+| `download-photos.mjs` | What is on the images? (never write vision rules from imagination) |
+| `validate.mjs` | Does the prompt still parse every case after an edit? |
+| `read-cache.mjs` | What did the model return across the whole month? |
+| `event-study.mjs` | Directional move at +15m/+1h/+4h/+12h/+24h — edge horizon in one table |
+
+These scripts connect directly to the MongoDB collections and are designed to answer one precise question per run. The debugging doctrine in this project: never guess from code — reproduce the exact pipeline slice on real data.

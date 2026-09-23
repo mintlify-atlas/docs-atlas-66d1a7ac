@@ -1,0 +1,152 @@
+---
+title: "Step 1: Read the Channel's Posts Before Writing Any Code"
+sidebarTitle: "Read Posts"
+description: "Use telegram-reader to scrape the target channel and understand its exact signal format before writing a single line of strategy code or prompt rules."
+---
+
+## The Golden Rule: Reproduce the Pipeline on Real Data
+
+Every channel has its own signal format. Never guess from code what a channel posts. Before writing a schema, a prompt, or a single entry rule — scrape the channel and read its posts.
+
+This is the core debugging method of the entire project: reproduce the exact pipeline on real data. A scrape takes seconds; a mistake in the prompt design costs an entire backtest run and a cache-name increment.
+
+## Create the Channel Folder
+
+Every channel lives under `content/<channel_name>/`. Create the full structure upfront:
+
+```
+content/<channel_name>/
+  main.strategy.ts   # production: 5m cache, ≤15-minute post freshness
+  main.test.ts       # snippet library + test variant (4h cache)
+  prompt.mustache    # LLM prompt for THIS channel's post format
+  session.txt        # MTProto session (shared per Telegram account)
+  README.md          # strategy description and post format notes
+  assets/            # channel-specific debug scripts
+  dump/              # backtest reports
+```
+
+The `assets/` directory holds scripts you'll need again — give each a header comment with usage instructions, following the pattern in `content/crypto_yoda_channel/assets/` and `content/vershinin_trader/assets/`.
+
+## Set Up session.txt (One-Time Auth)
+
+`session.txt` is the MTProto session for your Telegram account. It is **shared across all channels on the same machine** — if another channel folder already has a working session, copy that file and skip authorization entirely.
+
+If there is no session yet:
+
+1. The project uses the built-in default `CC_TELEGRAM_API_ID` / `CC_TELEGRAM_API_HASH` from telegram-reader — don't add environment variables unless the defaults stop working. Custom `api_id`/`api_hash` from [my.telegram.org](https://my.telegram.org) can be passed via `setConfig` or env; the resolution order is `setConfig` → env → built-in defaults. Current values are visible through `getConfig()`.
+
+2. From the channel folder (the file saves to `cwd`), run the interactive sign-in once:
+
+   ```bash
+   node -e 'require("telegram-reader").signIn()'
+   ```
+
+   A QR code appears in the terminal — scan it in Telegram via **Settings → Devices → Link Desktop Device**. If two-factor authentication is enabled, the script asks for your password. The session is saved to `./session.txt` and reused by all subsequent calls without re-authorization.
+
+3. Verify by running any scrape from Step 1 below — it should complete without the error `getTelegram failed: no session found`.
+
+<Warning>
+Never call `signIn()` from automated scripts or strategy code. It is interactive and expects a human to scan the QR code. Run it manually once, then rely on the saved `session.txt`.
+</Warning>
+
+## Run Scrape Scripts from the Channel Folder
+
+`telegram-reader` reads `./session.txt` from the **current working directory**. Always run scrape scripts from `content/<channel_name>/`, not from the project root.
+
+Use a standard ESM import — no CommonJS workarounds required:
+
+```js
+import { scrapePage, scrapeLookback, scrapeDay } from "telegram-reader";
+```
+
+Put temporary scripts next to the strategy as `debug.tmp.mjs` and delete them after debugging.
+
+<Tip>
+Filter out resize noise from the terminal output by piping through `grep -v "resize begin"`:
+
+```bash
+node debug.tmp.mjs | grep -v "resize begin"
+```
+</Tip>
+
+## The Three Scrape APIs
+
+| API | When to use |
+|-----|-------------|
+| `scrapePage` | Paginate backward without a time window — best for initial exploration of the last N posts |
+| `scrapeDay` | Read a specific calendar day — useful to reproduce what the strategy saw on a known date |
+| `scrapeLookback` | Window back from `when` (no look-ahead) — this is what the production strategy uses |
+
+### Example: Read the Last 50 Posts
+
+```js
+import { scrapePage } from "telegram-reader";
+
+const messages = await scrapePage({
+  channel: "<channel_name>",
+  limit: 50,
+  offset: 0,
+  when: new Date("2027-01-01T00:00:00Z"),
+});
+
+for (const m of messages) {
+  console.log(`=== id=${m.id} date=${m.date.toISOString()}`);
+  console.log(m.content.slice(0, 400));
+}
+```
+
+Run this from `content/<channel_name>/`, piped through `grep -v "resize begin"`.
+
+## What to Look For
+
+Read at least 50–100 posts before designing anything. Answer these questions from actual posts, not assumptions:
+
+**Signal format**
+- Does the author give a price range (entry from–to) or a single point entry?
+- How many targets? Prices or percentages?
+- Is there a stop-loss in every signal post?
+- Text only, or images too (charts, exchange cards)?
+
+**Ticker tag format**
+- Does the author tag the coin? (`#BTC/USDT`, `#PENGU/USDT`, bare `BTC`)
+- The strategy uses this tag to filter posts before calling the LLM — no tag means no pre-filter is possible.
+
+**Non-signal post types**
+- Profit reports (e.g., "Take-profit 3 ✅") — must return `position: "wait"`
+- Ads, analytics, commentary — must return `position: "wait"`
+- The prompt must explicitly instruct the model to filter all of these.
+
+**Post frequency and rhythm**
+- How often does the author post signals vs. non-signals?
+- Does the author post close/exit updates in separate posts?
+
+## Special Cases
+
+### Channel Without a Ticker Tag
+
+Some channels (e.g., vershinin) post tickers as bare words: `BTC`, `1000PEPE`. Pre-LLM filtering by ticker is impossible — every post in the window goes to the model.
+
+In this case, the prompt **must** explicitly say: "scan ALL messages; return `wait` only if there is no entry for `{{symbol}}` in any of them." Without this instruction, the model latches onto the last post in the batch and drops signals from adjacent posts. This failure was caught by the validation script as a FAIL.
+
+### Private Channel
+
+For private channels, `CHANNEL_NAME` is a numeric ID (e.g., `"-1002833393903"`). Links in the message struct are built differently:
+
+```js
+`https://t.me/c/${channel.slice(4)}/${id}`
+```
+
+Note `channel.slice(4)` strips the `-100` prefix that Telegram internal IDs carry.
+
+### Author Announces Closes in Separate Posts
+
+If the channel author posts both entries and exits ("closing my shorts" in a separate post), the strategy needs a **dual pipeline**: two LLM calls, two cache names, two schemas.
+
+- **Open pipeline**: `listenIdlePing` → `getOpenSignal` (cached) → `commitCreateSignal`
+- **Close pipeline**: `listenActivePing` → `getCloseSignal` (cached, schema `hold | close`) → `commitClosePending`
+
+The `addStrategySchema` call is empty in this case — no `getSignal` — because entry and exit are handled by listeners directly.
+
+## Next Step
+
+Once you understand the signal format — range or point, how many targets, text or image, ticker tag or not — you have everything needed to design the LLM schema and prompt. Proceed to [Step 2: Design the LLM Prompt and Schema](/guides/prompt-design).

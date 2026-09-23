@@ -1,0 +1,259 @@
+---
+title: "telegram-reader: Telegram Userbot Scraping API"
+sidebarTitle: "telegram-reader"
+description: "Reference for telegram-reader 1.4.0: signIn, scrapeLookback, scrapePage, scrapeDay — MTProto userbot API for reading Telegram channels in backtests and production."
+---
+
+```typescript
+import {
+  signIn,
+  scrapeLookback,
+  scrapePage,
+  scrapeDay,
+} from "telegram-reader";  // version 1.4.0
+```
+
+telegram-reader is a MTProto userbot library built on gramjs. It reads messages from Telegram channels (public and private) for use in backtest strategies and production pipelines.
+
+---
+
+## Authentication
+
+### `signIn`
+
+Interactive one-time login. Saves the MTProto session to `./session.txt` in the current working directory.
+
+```typescript
+signIn(): Promise<void>
+```
+
+**Steps:**
+
+1. Run from the channel folder (`content/<channel>/`) — the session file is written to `cwd`:
+   ```bash
+   node -e 'require("telegram-reader").signIn()'
+   ```
+2. A QR code appears in the terminal. Scan it in Telegram: *Settings → Devices → Link Desktop Device*.
+3. If two-factor authentication is enabled, the process prompts for the password.
+4. The session is saved to `./session.txt` and reused automatically by all subsequent scrape calls.
+
+**Sharing sessions:** `session.txt` is tied to the Telegram account, not to a specific channel. If you already have a valid `session.txt` in another channel folder, copy it rather than running `signIn` again.
+
+**API credentials:** telegram-reader ships with built-in default `CC_TELEGRAM_API_ID` / `CC_TELEGRAM_API_HASH` values. Do not set your own unless the defaults stop working. Credential resolution order: `setConfig(...)` → environment variables → built-in defaults. Check current values with `getConfig()`.
+
+---
+
+## ScraperMessage
+
+The message object returned by all scrape functions.
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `number` | Telegram message ID |
+| `date` | `Date` | Publication timestamp |
+| `content` | `string` | Message text (empty string if the message has no text) |
+| `photo` | `string \| undefined` | Base64-encoded JPEG preview (800px) if the message has a photo |
+| `channel` | `string` | Channel username (e.g. `"crypto_yoda_channel"`) or numeric ID string (e.g. `"-1002833393903"`) |
+
+<Note>
+  When `ScraperMessage` objects are serialized to JSON (e.g. stored in `Cache.file`) and read back, `date` becomes a plain string. Always wrap with `new Date(message.date)` before calling `.getTime()` or any Date method.
+</Note>
+
+---
+
+## `scrapeLookback`
+
+Returns messages published in the window `[when − limit×dimension, when]`. **No look-ahead bias:** a post published after `when` is not visible. This is the primary function used in production strategies.
+
+```typescript
+scrapeLookback({
+  channel: string;
+  limit: number;
+  dimension: "minute" | "hour" | "day";
+  when: Date;
+}): Promise<ScraperMessage[]>
+```
+
+<ParamField path="channel" type="string" required>
+  Channel username or numeric ID string. See [Private Channels](#private-channels).
+</ParamField>
+
+<ParamField path="limit" type="number" required>
+  Number of `dimension` units to look back. Examples: `15` (15 minutes for production freshness gate), `240` (4 hours for test runs).
+</ParamField>
+
+<ParamField path="dimension" type='"minute" | "hour" | "day"' required>
+  Unit for the lookback window.
+</ParamField>
+
+<ParamField path="when" type="Date" required>
+  The backtest tick timestamp. The window ends here — posts after this moment are invisible.
+</ParamField>
+
+```typescript
+// Production: only posts from the last 15 minutes
+const messages = await scrapeLookback({
+  channel: "crypto_yoda_channel",
+  limit: 15,
+  dimension: "minute",
+  when,
+});
+
+// Test run: 4-hour window for LLM call reduction
+const messages = await scrapeLookback({
+  channel: "-1002833393903",
+  limit: 4 * 60,
+  dimension: "minute",
+  when,
+});
+```
+
+<Warning>
+  Always wrap `scrapeLookback` (and any other scrape call) inside `Cache.file`. `listenIdlePing` fires once per minute per symbol — without caching this becomes a constant stream of Telegram requests.
+</Warning>
+
+---
+
+## `scrapePage`
+
+Paginates through a channel's post history without a time window. Used for exploring the channel (reading recent posts, finding post IDs for validation cases).
+
+```typescript
+scrapePage({
+  channel: string;
+  limit: number;
+  offset: number;
+  when: Date;
+}): Promise<ScraperMessage[]>
+```
+
+<ParamField path="channel" type="string" required>
+  Channel username or numeric ID string.
+</ParamField>
+
+<ParamField path="limit" type="number" required>
+  Number of posts to return per page.
+</ParamField>
+
+<ParamField path="offset" type="number" required>
+  Number of posts to skip from the most recent. Use `0` for the first page.
+</ParamField>
+
+<ParamField path="when" type="Date" required>
+  Upper bound. Pass a far future date (e.g. `new Date("2027-01-01T00:00:00Z")`) to get the most recent posts.
+</ParamField>
+
+```typescript
+// Read the last 50 posts to study the channel's format
+const messages = await scrapePage({
+  channel: "crypto_yoda_channel",
+  limit: 50,
+  offset: 0,
+  when: new Date("2027-01-01T00:00:00Z"),
+});
+
+// Second page
+const page2 = await scrapePage({
+  channel: "crypto_yoda_channel",
+  limit: 50,
+  offset: 50,
+  when: new Date("2027-01-01T00:00:00Z"),
+});
+```
+
+---
+
+## `scrapeDay`
+
+Returns all messages from a specific calendar day.
+
+```typescript
+scrapeDay({
+  channel: string;
+  date: Date;
+}): Promise<ScraperMessage[]>
+```
+
+<ParamField path="channel" type="string" required>
+  Channel username or numeric ID string.
+</ParamField>
+
+<ParamField path="date" type="Date" required>
+  The calendar day to scrape.
+</ParamField>
+
+```typescript
+const messages = await scrapeDay({
+  channel: "crypto_yoda_channel",
+  date: new Date("2026-08-14"),
+});
+```
+
+Useful for reproducing the exact post window that a backtest tick saw — pass the tick's `when` date to verify what the strategy would have received.
+
+---
+
+## Private Channels
+
+Private channels do not have a public username. Use the channel's numeric ID (prefixed with `-100`) as the `channel` string:
+
+```typescript
+const CHANNEL_NAME = "-1002833393903";
+```
+
+Build shareable message links by stripping the `-100` prefix:
+
+```typescript
+const url = `https://t.me/c/${channel.slice(4)}/${id}`;
+// e.g. https://t.me/c/2833393903/3548
+```
+
+---
+
+## Telegram Flood Limits
+
+gramjs automatically handles `FLOOD_WAIT` errors:
+
+| Condition | Behavior |
+|---|---|
+| `FLOOD_WAIT ≤ 60s` | gramjs silently sleeps and retries. The scrape call is just slow — no error is thrown. |
+| `FLOOD_WAIT > 60s` | gramjs throws `FloodWaitError` (with a `seconds` field). telegram-reader does not catch it. The error propagates as `GET_SIGNAL_FN thrown` in the strategy. |
+
+The penalty escalates with repeated requests: 4s → 22s → ... Avoid repeated scrapes by ensuring every `scrapeLookback` call is wrapped in `Cache.file`.
+
+---
+
+## Running Debug Scripts
+
+All scrape scripts must be run from `content/<channel>/` so that `session.txt` is found in the current directory:
+
+```bash
+cd content/crypto_yoda_channel
+node assets/read-posts.mjs
+```
+
+Filter gramjs noise from stdout:
+
+```bash
+node assets/read-posts.mjs | grep -v "resize begin"
+```
+
+For temporary inline scripts, use a file named `debug.tmp.mjs` (delete after use). Avoid `node -e '...'` when the script contains Russian text with apostrophes — the shell mishandles single-quote nesting.
+
+---
+
+## sharp Module Note
+
+telegram-reader uses `sharp` internally for image processing (resizing channel photos to 800px JPEG). After **any** `npm install`, npm drops optional dependencies — `sharp` loses its platform-specific native binary and telegram-reader fails with:
+
+```
+Could not load the sharp module
+```
+
+Fix:
+
+```bash
+npm install --include=optional sharp
+```
+
+Run this after every `npm install` in the project root.
