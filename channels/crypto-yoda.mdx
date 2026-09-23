@@ -1,7 +1,7 @@
 ---
-title: "crypto_yoda_channel: Range + 5 Targets + Stop Signal Strategy"
+title: "crypto_yoda_channel Strategy: LLM Signals + Level Ratchet"
 sidebarTitle: "Crypto Yoda"
-description: "Full walkthrough of the crypto_yoda_channel strategy: LLM schema, freshness gate, level-ratchet trailing, structural breakeven, and what the event study revealed about this channel's edge."
+description: "Level-ratchet trailing and 15-min freshness gate for crypto_yoda_channel. Event study: 72% at 24h, EV −3.5% on author plan, +3.37% monthly PnL."
 ---
 
 ## Overview
@@ -171,7 +171,8 @@ const getSignal = Cache.file(
       return { entry: null };   // LLM is never called
     }
 
-    console.log("Parsing: ", messages[0].content.slice(-64));
+    const [msg] = messages;
+    console.log("Parsing: ", msg.content.slice(-64));
 
     // 4. Generate structured object via json-inference tool-grammar
     const entry = await generateObject(
@@ -299,7 +300,7 @@ function getLevelDrift(position: Position, levels: number[], lastLevel: number, 
 ### `listenActivePing` handler
 
 ```typescript
-listenActivePing(async ({ data, currentPrice }) => {
+listenActivePing(async ({ data, currentPrice, backtest, when }) => {
   const levels = <number[]>data.payload.levels;
   if (!levels?.length) return;
 

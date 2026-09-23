@@ -1,8 +1,10 @@
 ---
-title: "telegram-reader: Telegram Userbot Scraping API"
+title: "telegram-reader 1.4.0: MTProto Userbot Scraping API"
 sidebarTitle: "telegram-reader"
-description: "Reference for telegram-reader 1.4.0: signIn, scrapeLookback, scrapePage, scrapeDay — MTProto userbot API for reading Telegram channels in backtests and production."
+description: "telegram-reader 1.4.0: signIn, scrapeLookback, scrapePage, scrapeDay — MTProto userbot for Telegram channel scraping without look-ahead bias in backtests."
 ---
+
+`telegram-reader` (version 1.4.0) is a MTProto userbot library built on gramjs. It reads messages from Telegram channels — public and private — and returns structured `ScraperMessage` objects for use in backtest strategies and production pipelines. All scrape functions must be wrapped in `Cache.file` inside strategies to prevent repeated requests.
 
 ```typescript
 import {
@@ -12,8 +14,6 @@ import {
   scrapeDay,
 } from "telegram-reader";  // version 1.4.0
 ```
-
-telegram-reader is a MTProto userbot library built on gramjs. It reads messages from Telegram channels (public and private) for use in backtest strategies and production pipelines.
 
 ---
 

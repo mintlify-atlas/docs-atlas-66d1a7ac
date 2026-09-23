@@ -1,7 +1,7 @@
 ---
-title: "Exchange and Frame Modules: backtest.module.ts and paper.module.ts"
+title: "Module Reference: Exchange Schemas and Backtest Frame"
 sidebarTitle: "Modules"
-description: "Reference for the exchange schema modules that register Binance spot data through ccxt, the August 2026 backtest frame, and how to bring your own live.module.ts."
+description: "Exchange schema modules registering Binance spot data via ccxt, the aug_2026_frame backtest window, and requirements for live.module.ts."
 ---
 
 ## Overview
@@ -12,7 +12,7 @@ The `modules/` directory contains the exchange-schema registrations used by `loa
 |--------|-------------------|-----------------|-----------------|
 | `backtest.module.ts` | ✅ `ccxt-exchange` | ✅ `aug_2026_frame` | ❌ |
 | `paper.module.ts` | ✅ `ccxt-exchange` | ❌ | ❌ |
-| `live.module.ts` | user-supplied | ❌ | ✅ (user-supplied) |
+| `live.module.ts` | ✅ `ccxt-exchange` (placeholder) | ❌ | ❌ (replace with authenticated module) |
 
 ---
 
@@ -113,9 +113,9 @@ Because both modules use `Live.background` under the hood (see [Loader Config](/
 
 ---
 
-## `live.module.ts` — Bring Your Own
+## `live.module.ts`
 
-`live.module.ts` is **intentionally not provided** in this project. Real-money trading requires API keys, order execution logic, and account-specific risk parameters that belong in your own codebase. The expected workflow is to copy a working `live.module.ts` from another project.
+`live.module.ts` is present in the repo and is currently **structurally identical to `paper.module.ts`** — it registers the same public Binance spot exchange via ccxt with no API keys and no order-execution methods. This serves as a placeholder: to run real-money live trading you replace its contents with an authenticated exchange module copied from another project.
 
 ### Requirements for a compatible `live.module.ts`
 

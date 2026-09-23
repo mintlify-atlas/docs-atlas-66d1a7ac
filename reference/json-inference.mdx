@@ -1,8 +1,10 @@
 ---
 title: "json-inference: Structured Ollama Output That Actually Works"
 sidebarTitle: "json-inference"
-description: "API reference for json-inference 1.1.0: generateObject, generateText, FormatModel schema rules, InferenceName, and vision (images) support for multimodal models."
+description: "API reference for json-inference 1.1.0: generateObject, FormatModel schema rules, vision image support, and why it replaces raw ollama.chat with format."
 ---
+
+`json-inference` (version 1.1.0) fixes broken structured output for cloud-tier Ollama models. It passes the response schema as a `provide_answer` tool declaration — forcing the model to return a valid JSON object — then validates and retries on any mismatch. All LLM calls in this project go through `generateObject` or `generateText`; direct `ollama.chat` with `format` is never used.
 
 ```typescript
 import {

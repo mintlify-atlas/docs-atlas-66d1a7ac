@@ -1,8 +1,10 @@
 ---
 title: "Step 4: Ship the Production Strategy with 5-Minute Cache"
 sidebarTitle: "Production Strategy"
-description: "Convert the test strategy into a production main.strategy.ts: 5-minute cache, 15-minute freshness gate, final entry rules, and walk-forward validated constants."
+description: "Convert the test strategy to main.strategy.ts with 5-minute cache, 15-minute freshness gate, entry rules from channel format, and validated constants."
 ---
+
+The production strategy is `main.strategy.ts` — derived from the validated `main.test.ts` by switching to a 5-minute cache, tightening the scrape window to 15 minutes, and adding a freshness gate that silently drops stale signals. The edge in Telegram trading channels lives close to the moment of publication; the production setup is designed to capture it.
 
 ## From Test to Production
 

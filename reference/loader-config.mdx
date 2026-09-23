@@ -1,7 +1,7 @@
 ---
 title: "CLI Entry Point: loader.config.ts and Command-Line Flags"
 sidebarTitle: "Loader Config"
-description: "Reference for config/loader.config.ts: the --entry, --backtest, --live, --paper, and --cache flags, SYMBOL_LIST, and how the loader wires strategy, exchange, and frame schemas."
+description: "How config/loader.config.ts wires --entry, --backtest, --live, --paper, and --cache flags to strategy, exchange, and frame schemas."
 ---
 
 ## Overview
@@ -32,6 +32,10 @@ npm start -- --backtest --entry ./content/crypto_yoda_channel/main.strategy.ts
 
 <Note>
 `--entry` is parsed as a `boolean` flag by `parseArgs`, not as a string path. The actual path resolution is handled upstream by `@backtest-kit/cli` before `loader.config.ts` runs.
+</Note>
+
+<Note>
+`--ui` is **not** a flag in `loader.config.ts`. It is consumed by `@backtest-kit/cli` itself to start the web UI dashboard. Because `parseArgs` is called with `strict: false`, any unknown flags (including `--ui`) are silently passed through without error. You will see `--ui` in run-command examples — it launches the dashboard, not anything inside the loader.
 </Note>
 
 ---

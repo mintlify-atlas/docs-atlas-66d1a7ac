@@ -1,7 +1,7 @@
 ---
-title: "backtest-kit API: Strategies, Listeners, and Commit Functions"
+title: "backtest-kit API: Listeners, Commits, Cache, and State"
 sidebarTitle: "backtest-kit API"
-description: "Complete reference for all backtest-kit functions used in backtest-ollama-casual: addStrategySchema, listeners, commit functions, State, Position helpers, Cache, and Log."
+description: "Reference for backtest-kit 20.1.0: addStrategySchema, listenIdlePing, listenActivePing, commit functions, State, Position helpers, Cache, and Log."
 ---
 
 This page documents every `backtest-kit` function used in the project's strategy files. All imports are from the `"backtest-kit"` package (version `20.1.0`).
@@ -185,6 +185,7 @@ Fires on every tick when a position **is open** for the symbol. Used for ratchet
 ```typescript
 listenActivePing(
   callback: (ctx: {
+    symbol: string;
     data: ActiveSignalData;
     currentPrice: number;
     backtest: boolean;
@@ -277,10 +278,10 @@ commitCreateSignal(
     position: "long" | "short";
     priceTakeProfit: number;
     priceStopLoss: number;
-    minuteEstimatedTime: number;
+    minuteEstimatedTime?: number;  // omit for open-ended; Infinity for explicit open-ended
     payload?: Record<string, unknown>;
     note?: string;
-    priceOpen?: number;        // omit for market entry
+    priceOpen?: number;            // omit for market entry
   }
 ): Promise<void>
 ```
@@ -305,8 +306,8 @@ commitCreateSignal(
   Stop-loss price.
 </ParamField>
 
-<ParamField path="dto.minuteEstimatedTime" type="number" required>
-  Estimated hold time in minutes. Use `Infinity` for open-ended positions.
+<ParamField path="dto.minuteEstimatedTime" type="number">
+  Estimated hold time in minutes. Use `Infinity` for explicitly open-ended positions (crypto_yoda pattern). Can be omitted entirely when using `Position.moonbag` (vershinin pattern).
 </ParamField>
 
 <ParamField path="dto.priceOpen" type="number">

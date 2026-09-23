@@ -4,6 +4,8 @@ sidebarTitle: "Prompt Design"
 description: "Write prompt.mustache and the FormatModel JSON schema from the author's actual posts, then debug inline with generateObject before touching strategy code."
 ---
 
+The prompt and schema for a channel are derived entirely from what you read in Step 1 — not from a generic template. `json-inference` passes the schema as tool-call parameters to Ollama, forcing valid structured output from `gemma4:31b-cloud`; the `prompt.mustache` file tells the model what to extract and what to ignore, using real examples from the channel's own posts.
+
 ## Everything Comes from the Channel's Posts
 
 The prompt and schema are designed from what you saw in Step 1 — not from a generic template. The crypto_yoda channel (range entry + 5 targets + stop) is a worked example; a channel with one target, percentage-based targets, or direction-only signals will have a different schema.

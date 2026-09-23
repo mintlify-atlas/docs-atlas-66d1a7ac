@@ -1,8 +1,10 @@
 ---
-title: "Step 3: Run the Test Strategy Over a Full Month"
+title: "Step 3: Test Strategy Over a Full Month of Real Posts"
 sidebarTitle: "Test Strategy"
-description: "Use a 4-hour cache interval and a full month backtest to debug the LLM prompt in practice, collect measure-items, and analyze model output quality before going to production."
+description: "Use a 4-hour cache interval to run the full month backtest, debug the prompt on real posts, and collect measure-items for output quality inspection."
 ---
+
+The test strategy runs the validated prompt from Step 2 against a full month of posts using a 4-hour cache interval. It is not designed to be profitable — it enters hours late. Its job is to exercise the LLM over the channel's entire post history, collect every model response as a `measure-item` in MongoDB, and surface any parsing errors before they reach the production strategy.
 
 ## Purpose: Debug the Prompt in Practice, Not Profitability
 

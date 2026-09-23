@@ -1,8 +1,10 @@
 ---
-title: "Get Started with backtest-ollama-casual"
+title: "Set Up backtest-ollama-casual and Run Your First Backtest"
 sidebarTitle: "Quickstart"
 description: "Install dependencies, authorize Telegram, start MongoDB and Ollama, then run your first backtest against a signal channel in under 10 minutes."
 ---
+
+This guide walks you through installing dependencies, authorizing Telegram, starting the required infrastructure, and running a backtest against the shipped `crypto_yoda_channel` worked example. The full setup takes under 10 minutes on a machine that already has Node.js, Docker, and Ollama installed.
 
 <Warning>
   The backtest command and the Telegram `signIn()` call **must be run by you, the user** — both are interactive processes. The `signIn()` flow displays a QR code in your terminal; the backtest command streams live output that you monitor as it runs. Neither can be automated or delegated.

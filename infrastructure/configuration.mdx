@@ -1,7 +1,7 @@
 ---
-title: "Configure Symbols, Frames, and Runtime Modes"
+title: "Configuring Symbol Lists, Frames, and Execution Modes"
 sidebarTitle: "Configuration"
-description: "How SYMBOL_LIST, backtest frames, exchange schema, and the three runtime modes (backtest, paper, live) are wired together through config/loader.config.ts and the modules/ directory."
+description: "How SYMBOL_LIST, backtest frames, exchange schemas, and CLI flags (--backtest, --paper, --live, --cache) are wired together through loader.config.ts."
 ---
 
 ## Overview
@@ -65,7 +65,14 @@ Then it loops over `SYMBOL_LIST` and fires off a background worker per symbol:
 
 ```ts
 for (const symbol of SYMBOL_LIST) {
-  if (values.live || values.paper) {
+  if (values.live) {
+    Live.background(symbol, {
+      exchangeName: exchangeSchema.exchangeName,
+      strategyName: strategySchema.strategyName,
+    });
+    continue;
+  }
+  if (values.paper) {
     Live.background(symbol, {
       exchangeName: exchangeSchema.exchangeName,
       strategyName: strategySchema.strategyName,
